@@ -1,7 +1,5 @@
 # ============================================================
-# Script: dc_config.ps1
-# Version: 2.0-gold
-#
+# Script: dcconfig.ps1
 # Purpose:
 #   Domain controller baseline configuration (STRUCTURE ONLY)
 #
@@ -10,23 +8,32 @@
 #   - User placement
 #   - Fine-Grained Password Policies
 #   - GPO object creation and linking
+#   - GPO Settings
 #
 # Coding: (bad)Copilot
 # Mastermind: sp
+#
+# Version History:
+#   2.0-gold: Initial version. Creates the Active Directory baseline: OU structure, administrative groups, FGPPs, and GPO objects with linking only. No policy settings are applied.
+#   2.1: Populates all baseline GPOs with security, firewall, Defender, SMB, RDP, Windows Update, and startup reliability settings, forming the complete domain hardening configuration.
 # ============================================================
+
+
+##############################################
+###            Version 2.0-gold            ###
+##############################################
 
 Import-Module ActiveDirectory
 Import-Module GroupPolicy
 
 Write-Host ""
-Write-Host "=== dc_config.ps1 2.0-gold ===" -ForegroundColor White
-Write-Host "=== STRUCTURE-ONLY BOOTSTRAP ===" -ForegroundColor Cyan
+Write-Host "===        dcconfig        ===" -ForegroundColor Cyan
+Write-Host "==============================" -ForegroundColor Cyan
 Write-Host ""
 
 # ============================================================
 # Helper Functions
 # ============================================================
-
 function Confirm-Action {
     param ([string]$Message)
 
@@ -54,7 +61,7 @@ function New-OU {
     }
 }
 
-function New-GPO {
+function New-ClkGPO {
     param ([string]$Name)
 
     if (-not (Get-GPO -Name $Name -ErrorAction SilentlyContinue)) {
@@ -66,7 +73,7 @@ function New-GPO {
     }
 }
 
-function New-GPOLink {
+function New-ClkGPOLink {
     param (
         [string]$GPOName,
         [string]$TargetOU,
@@ -78,11 +85,11 @@ function New-GPOLink {
 
     if (-not $existing) {
         if ($Disabled) {
-            New-GPLink -Name $GPOName -Target $TargetOU -LinkEnabled No
+            New-GPLink -Name $GPOName -Target $TargetOU -LinkEnabled No | Out-Null
             Write-Host "Linked (disabled): $GPOName -> $TargetOU" -ForegroundColor Yellow
         }
         else {
-            New-GPLink -Name $GPOName -Target $TargetOU
+            New-GPLink -Name $GPOName -Target $TargetOU | Out-Null
             Write-Host "Linked: $GPOName -> $TargetOU" -ForegroundColor Green
         }
     }
@@ -94,7 +101,6 @@ function New-GPOLink {
 # ============================================================
 # Root OU Input
 # ============================================================
-
 $RootOUName = Read-Host "Enter the root OU name (e.g. CONTOSO, ACME)"
 
 if ([string]::IsNullOrWhiteSpace($RootOUName)) {
@@ -116,7 +122,6 @@ $WorkstationsOU = "OU=Workstations,$ComputersOU"
 # ============================================================
 # OU Structure
 # ============================================================
-
 if (Confirm-Action "Create baseline OU structure?") {
 
     New-OU $RootOUName $DomainDN
@@ -139,7 +144,6 @@ Write-Host ""
 # ============================================================
 # Janitors Group
 # ============================================================
-
 $JanitorsOU = "OU=Security,$GroupsOU"
 $JanitorsGroup = "Janitors"
 
@@ -159,7 +163,6 @@ Write-Host "Ensured current user is member of Janitors" -ForegroundColor Green
 # ============================================================
 # Move User to Admins OU
 # ============================================================
-
 if (Confirm-Action "Move current user '$($CurrentUser.SamAccountName)' to Admins OU?") {
     if ($CurrentUser.DistinguishedName -notlike "*OU=Admins,*") {
         Move-ADObject -Identity $CurrentUser.DistinguishedName -TargetPath $AdminsOU
@@ -173,7 +176,6 @@ if (Confirm-Action "Move current user '$($CurrentUser.SamAccountName)' to Admins
 # ============================================================
 # FGPPs
 # ============================================================
-
 if (Confirm-Action "Create Fine-Grained Password Policies?") {
 
     if (-not (Get-ADFineGrainedPasswordPolicy -Filter "Name -eq 'Domain Admin Policy'")) {
@@ -215,7 +217,6 @@ if (Confirm-Action "Create Fine-Grained Password Policies?") {
 # ============================================================
 # GPO Creation
 # ============================================================
-
 $GPOs = @(
     "Security: Enable Firewall",
     "Firewall: Default Server Rules",
@@ -242,43 +243,560 @@ $GPOs = @(
 
 if (Confirm-Action "Create baseline GPO objects?") {
     foreach ($gpo in $GPOs) {
-        New-GPO $gpo
+        New-ClkGPO $gpo
     }
 }
 
 # ============================================================
 # GPO Linking (NO SETTINGS)
 # ============================================================
-
+Write-Host ""
+Write-Host "Linking GPOs to OUs ..."
 foreach ($gpo in $GPOs) {
     switch ($gpo) {
-	"Security: Enable Firewall"		 { New-GPOLink $gpo $ComputersOU }
-        "Firewall: Default Server Rules"         { New-GPOLink $gpo $ServersOU }
-        "Firewall: Default Workstation Rules"    { New-GPOLink $gpo $WorkstationsOU }
-	"Firewall: Allow from DC"		 { New-GPOLink $gpo $ComputersOU $true }
-	"Firewall: Allow from Clickwork HQ"	 { New-GPOLink $gpo $ComputersOU $true }
-	"Firewall: Allow ESMC"			 { New-GPOLink $gpo $ComputersOU $true }
-	"Security: Enable Defender"		 { New-GPOLink $gpo $ComputersOU }
-	"Security: Ctrl+Alt+Del"		 { New-GPOLink $gpo $ComputersOU }
-	"Security: Disable AutoPlay"		 { New-GPOLink $gpo $ComputersOU }
-	"Security: SMB Hardening"		 { New-GPOLink $gpo $ComputersOU }
-	"Settings: Wait for network"		 { New-GPOLink $gpo $ComputersOU }
-	"Settings: Enable RDP"			 { New-GPOLink $gpo $ComputersOU }
-        "Settings: NoSleep"                      { New-GPOLink $gpo $WorkstationsOU $true }
-        "Settings: Workstation Updates"          { New-GPOLink $gpo $WorkstationsOU }
-        "Printers: Remove garbage"               { New-GPOLink $gpo $WorkstationsOU $true }
-        "Customization: Regional"                { New-GPOLink $gpo $UsersOU $true }
-        "Customization: Explorer"                { New-GPOLink $gpo $UsersOU $true }
-        "Customization: NoCloud content"         { New-GPOLink $gpo $UsersOU $true }
-        "Customization: Lock Screen"             { New-GPOLink $gpo $WorkstationsOU $true }
-        "Customization: Wallpaper"               { New-GPOLink $gpo $WorkstationsOU $true }
+	"Security: Disable AutoPlay"		 { New-ClkGPOLink $gpo $ComputersOU }
+	"Security: SMB Hardening"		 { New-ClkGPOLink $gpo $ComputersOU }
+	"Security: Enable Firewall"		 { New-ClkGPOLink $gpo $ComputersOU }
+	"Security: Enable Defender"		 { New-ClkGPOLink $gpo $ComputersOU }
+        "Firewall: Default Server Rules"         { New-ClkGPOLink $gpo $ServersOU }
+        "Firewall: Default Workstation Rules"    { New-ClkGPOLink $gpo $WorkstationsOU }
+	"Settings: Wait for network"		 { New-ClkGPOLink $gpo $ComputersOU }
+	"Settings: Enable RDP"			 { New-ClkGPOLink $gpo $ComputersOU }
+	"Settings: Workstation Updates"          { New-ClkGPOLink $gpo $WorkstationsOU }
+	"Security: Ctrl+Alt+Del"		 { New-ClkGPOLink $gpo $ComputersOU $true }
+	"Firewall: Allow from DC"		 { New-ClkGPOLink $gpo $ComputersOU $true }
+	"Firewall: Allow from Clickwork HQ"	 { New-ClkGPOLink $gpo $ComputersOU $true }
+	"Firewall: Allow ESMC"			 { New-ClkGPOLink $gpo $ComputersOU $true }
+        "Printers: Remove garbage"               { New-ClkGPOLink $gpo $WorkstationsOU $true }
+        "Customization: Lock Screen"             { New-ClkGPOLink $gpo $WorkstationsOU $true }
+        "Customization: Wallpaper"               { New-ClkGPOLink $gpo $WorkstationsOU $true }
+	"Customization: Regional"                { New-ClkGPOLink $gpo $UsersOU $true }
+        "Customization: Explorer"                { New-ClkGPOLink $gpo $UsersOU $true }
+        "Customization: NoCloud content"         { New-ClkGPOLink $gpo $UsersOU $true }
+	"Settings: NoSleep"                      { New-ClkGPOLink $gpo $WorkstationsOU $true }
         "Settings: EDGE Policies"                {
-                                                    New-GPOLink $gpo $UsersOU $true
-                                                    New-GPOLink $gpo $AdminsOU $true
+                                                    New-ClkGPOLink $gpo $UsersOU $true
+                                                    New-ClkGPOLink $gpo $AdminsOU $true
                                                   }
-        default                                  { New-GPOLink $gpo $ComputersOU }
+        default                                  { New-ClkGPOLink $gpo $ComputersOU }
     }
 }
 
+
+
+
+#########################################
+###            Version 2.1            ###
+#########################################
+
 Write-Host ""
-Write-Host "=== dc_config.ps1 2.0-gold completed ===" -ForegroundColor White
+Write-Host "Populating GPO settings ..."
+
+###
+# GPO: Security: Enable Firewall
+# Including Administrative Template: "Protect all network connections" (Standard Profile)
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$FirewallEnableGPO = "Security: Enable Firewall"
+
+# ------------------------------------------------------------
+# Enable firewall engine for all profiles
+# ------------------------------------------------------------
+$Profiles = @("DomainProfile", "PrivateProfile", "PublicProfile")
+
+foreach ($FWProfile in $Profiles) {
+    Set-GPRegistryValue `
+        -Name $FirewallEnableGPO `
+        -Key "HKLM\Software\Policies\Microsoft\WindowsFirewall\$FWProfile" `
+        -ValueName "EnableFirewall" `
+        -Type DWord `
+        -Value 1 | Out-Null
+}
+
+Set-GPRegistryValue `
+    -Name $FirewallEnableGPO `
+    -Key "HKLM\Software\Policies\Microsoft\WindowsFirewall\StandardProfile" `
+    -ValueName "EnableFirewall" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Write-Host "Populated GPO: $FirewallEnableGPO" -ForegroundColor Green
+
+
+###
+# GPO: Firewall: Default Server Rules
+# Path: Administrative Templates > Network > Network Connections > Windows Defender Firewall > Domain Profile
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$ServerFirewallGPO = "Firewall: Default Server Rules"
+
+# ------------------------------------------------------------
+# Resolve DC IPv4 addresses (static snapshot, matches .pol behavior)
+# ------------------------------------------------------------
+$DCIPs = Get-ADDomainController -Filter * |
+    Select-Object -ExpandProperty IPv4Address |
+    Where-Object { $_ }
+
+$DCIPString = ($DCIPs -join ",")
+
+$DomainProfileKey = "HKLM\Software\Policies\Microsoft\WindowsFirewall\DomainProfile"
+
+# ------------------------------------------------------------
+# Allow ICMP exceptions → Allow inbound echo request
+# (.pol: DomainProfile\IcmpSettings)
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $ServerFirewallGPO `
+    -Key "$DomainProfileKey\IcmpSettings" `
+    -ValueName "AllowInboundEchoRequest" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+# ------------------------------------------------------------
+# Allow inbound remote administration exception (DC IP only)
+# (.pol: DomainProfile\RemoteAdminSettings)
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $ServerFirewallGPO `
+    -Key "$DomainProfileKey\RemoteAdminSettings" `
+    -ValueName "Enabled" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+Set-GPRegistryValue `
+    -Name $ServerFirewallGPO `
+    -Key "$DomainProfileKey\RemoteAdminSettings" `
+    -ValueName "RemoteAddresses" `
+    -Type String `
+    -Value $DCIPString | Out-Null
+
+# ------------------------------------------------------------
+# Allow inbound file and printer sharing (DC IP only)
+# (.pol: DomainProfile\Services\FileAndPrint)
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $ServerFirewallGPO `
+    -Key "$DomainProfileKey\Services\FileAndPrint" `
+    -ValueName "Enabled" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+Set-GPRegistryValue `
+    -Name $ServerFirewallGPO `
+    -Key "$DomainProfileKey\Services\FileAndPrint" `
+    -ValueName "RemoteAddresses" `
+    -Type String `
+    -Value $DCIPString | Out-Null
+
+# ------------------------------------------------------------
+# Allow inbound Remote Desktop exceptions (DC IP only)
+# (.pol: DomainProfile\Services\RemoteDesktop)
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $ServerFirewallGPO `
+    -Key "$DomainProfileKey\Services\RemoteDesktop" `
+    -ValueName "Enabled" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+Set-GPRegistryValue `
+    -Name $ServerFirewallGPO `
+    -Key "$DomainProfileKey\Services\RemoteDesktop" `
+    -ValueName "RemoteAddresses" `
+    -Type String `
+    -Value $DCIPString | Out-Null
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Write-Host "Populated GPO: $ServerFirewallGPO" -ForegroundColor Green
+
+
+###
+# GPO: Firewall: Default Workstation Rules
+# Path: Administrative Templates > Network > Network Connections > Windows Defender Firewall > Domain Profile
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$WorkstationFirewallGPO = "Firewall: Default Workstation Rules"
+
+# ------------------------------------------------------------
+# Resolve DC IPv4 addresses (static snapshot, matches ADMX behavior)
+# ------------------------------------------------------------
+$DCIPs = Get-ADDomainController -Filter * |
+    Select-Object -ExpandProperty IPv4Address |
+    Where-Object { $_ }
+
+$DCIPString = ($DCIPs -join ",")
+
+$DomainProfileKey = "HKLM\Software\Policies\Microsoft\WindowsFirewall\DomainProfile"
+
+# ------------------------------------------------------------
+# Allow ICMP exceptions → Allow inbound echo request
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $WorkstationFirewallGPO `
+    -Key "$DomainProfileKey\IcmpSettings" `
+    -ValueName "AllowInboundEchoRequest" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+# ------------------------------------------------------------
+# Allow inbound remote administration exception (DC IP only)
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $WorkstationFirewallGPO `
+    -Key "$DomainProfileKey\RemoteAdminSettings" `
+    -ValueName "Enabled" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+Set-GPRegistryValue `
+    -Name $WorkstationFirewallGPO `
+    -Key "$DomainProfileKey\RemoteAdminSettings" `
+    -ValueName "RemoteAddresses" `
+    -Type String `
+    -Value $DCIPString | Out-Null
+
+# ------------------------------------------------------------
+# Allow inbound file and printer sharing (DC IP only)
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $WorkstationFirewallGPO `
+    -Key "$DomainProfileKey\Services\FileAndPrint" `
+    -ValueName "Enabled" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+Set-GPRegistryValue `
+    -Name $WorkstationFirewallGPO `
+    -Key "$DomainProfileKey\Services\FileAndPrint" `
+    -ValueName "RemoteAddresses" `
+    -Type String `
+    -Value $DCIPString | Out-Null
+
+# ------------------------------------------------------------
+# Allow inbound Remote Desktop exceptions (DC IP only)
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $WorkstationFirewallGPO `
+    -Key "$DomainProfileKey\Services\RemoteDesktop" `
+    -ValueName "Enabled" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+Set-GPRegistryValue `
+    -Name $WorkstationFirewallGPO `
+    -Key "$DomainProfileKey\Services\RemoteDesktop" `
+    -ValueName "RemoteAddresses" `
+    -Type String `
+    -Value $DCIPString | Out-Null
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Write-Host "Populated GPO: $WorkstationFirewallGPO" -ForegroundColor Green
+
+
+###
+# GPO: Security: Enable Defender
+# Path: Administrative Templates > Windows Components > Microsoft Defender Antivirus
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$DefenderGPO = "Security: Enable Defender"
+
+$BaseKey = "HKLM\Software\Policies\Microsoft\Windows Defender"
+
+# ------------------------------------------------------------
+# Turn on Microsoft Defender Antivirus
+# Policy: Turn off Microsoft Defender Antivirus = Disabled
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $DefenderGPO `
+    -Key $BaseKey `
+    -ValueName "DisableAntiSpyware" `
+    -Type DWord `
+    -Value 0 | Out-Null
+
+# ------------------------------------------------------------
+# Enable real-time protection
+# Policy: Turn on real-time protection = Enabled
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $DefenderGPO `
+    -Key "$BaseKey\Real-Time Protection" `
+    -ValueName "DisableRealtimeMonitoring" `
+    -Type DWord `
+    -Value 0 | Out-Null
+
+# ------------------------------------------------------------
+# Enable cloud-delivered protection
+# Policy: Turn on cloud-delivered protection = Enabled
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $DefenderGPO `
+    -Key "$BaseKey\Spynet" `
+    -ValueName "SpynetReporting" `
+    -Type DWord `
+    -Value 2 | Out-Null
+
+# ------------------------------------------------------------
+# Enable automatic sample submission
+# Policy: Send file samples when further analysis is required
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $DefenderGPO `
+    -Key "$BaseKey\Spynet" `
+    -ValueName "SubmitSamplesConsent" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+# ------------------------------------------------------------
+# Enable Potentially Unwanted Application (PUA) protection
+# Policy: Configure detection for potentially unwanted applications = Enabled (Block)
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $DefenderGPO `
+    -Key "HKLM\Software\Policies\Microsoft\Windows Defender" `
+    -ValueName "PUAProtection" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Write-Host "Populated GPO: $DefenderGPO" -ForegroundColor Green
+
+
+###
+# GPO: Security: Disable AutoPlay
+# Path: Administrative Templates > Windows Components > AutoPlay Policies
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$AutoPlayGPO = "Security: Disable AutoPlay"
+
+# ------------------------------------------------------------
+# Set the default behavior for AutoRun = Enabled
+# Default AutoRun Behavior: Do not execute any autorun commands
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $AutoPlayGPO `
+    -Key "HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" `
+    -ValueName "NoAutorun" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+# ------------------------------------------------------------
+# Turn off AutoPlay = Enabled
+# Turn off AutoPlay on: All drives
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $AutoPlayGPO `
+    -Key "HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" `
+    -ValueName "NoDriveTypeAutoRun" `
+    -Type DWord `
+    -Value 255 | Out-Null
+
+# ------------------------------------------------------------
+# Disallow AutoPlay for non-volume devices = Enabled
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $AutoPlayGPO `
+    -Key "HKLM\Software\Policies\Microsoft\Windows\Explorer" `
+    -ValueName "NoAutoplayfornonVolume" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Write-Host "Populated GPO: $AutoPlayGPO" -ForegroundColor Green
+
+
+###
+# GPO: Security: SMB Hardening
+# Policies:
+# - Disable Computer Browser service
+# - Disable SMBv1
+# - Disable insecure guest logons
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$SmbHardeningGPO = "Security: SMB Hardening"
+
+# ------------------------------------------------------------
+# Disable Computer Browser service
+# System Services → Computer Browser → Startup Mode: Disabled
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $SmbHardeningGPO `
+    -Key "HKLM\SYSTEM\CurrentControlSet\Services\Browser" `
+    -ValueName "Start" `
+    -Type DWord `
+    -Value 4 | Out-Null
+
+# ------------------------------------------------------------
+# Disable SMBv1 protocol (Lanman Server)
+# Administrative Templates → Network → Lanman Server
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $SmbHardeningGPO `
+    -Key "HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" `
+    -ValueName "SMB1" `
+    -Type DWord `
+    -Value 0 | Out-Null
+
+# ------------------------------------------------------------
+# Disable insecure guest logons (Lanman Workstation)
+# Administrative Templates → Network → Lanman Workstation
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $SmbHardeningGPO `
+    -Key "HKLM\Software\Policies\Microsoft\Windows\LanmanWorkstation" `
+    -ValueName "AllowInsecureGuestAuth" `
+    -Type DWord `
+    -Value 0 | Out-Null
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Write-Host "Populated GPO: $SmbHardeningGPO" -ForegroundColor Green
+
+
+###
+# GPO: Settings: Wait for network
+# ADMX Policy: System\Logon\Always wait for the network at computer startup and logon = Enabled
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$WaitForNetworkGPO = "Settings: Wait for network"
+
+# ------------------------------------------------------------
+# Always wait for the network at startup and logon
+# ------------------------------------------------------------
+#Set-GPRegistryValue `
+#   -Name $WaitForNetworkGPO `
+#    -Key "HKLM\Software\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon" `
+#    -ValueName "AlwaysWaitForNetworkAtStartupAndLogon" `
+#    -Type DWord `
+#    -Value 1
+
+# ------------------------------------------------------------
+# Synchronous foreground policy processing (required by ADMX)
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $WaitForNetworkGPO `
+    -Key "HKLM\Software\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon" `
+    -ValueName "SyncForegroundPolicy" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Write-Host "Populated GPO: $WaitForNetworkGPO" -ForegroundColor Green
+
+
+###
+# GPO: Settings: Enable RDP
+# ADMX Policies:
+# - Allow users to connect remotely by using Remote Desktop Services
+# - Require user authentication for remote connections by using Network Level Authentication
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$EnableRdpGPO = "Settings: Enable RDP"
+
+# ------------------------------------------------------------
+# Allow users to connect remotely using Remote Desktop Services
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $EnableRdpGPO `
+    -Key "HKLM\Software\Policies\Microsoft\Windows NT\Terminal Services" `
+    -ValueName "fDenyTSConnections" `
+    -Type DWord `
+    -Value 0 | Out-Null
+
+# ------------------------------------------------------------
+# Require Network Level Authentication (NLA)
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $EnableRdpGPO `
+    -Key "HKLM\Software\Policies\Microsoft\Windows NT\Terminal Services" `
+    -ValueName "UserAuthentication" `
+    -Type DWord `
+    -Value 1 | Out-Null
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Write-Host "Populated GPO: $EnableRdpGPO" -ForegroundColor Green
+
+
+###
+# GPO: Settings: Workstation Updates
+# ADMX Policy: Windows Update → Configure Automatic Updates
+# Option: Auto download and schedule the install
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$WorkstationUpdatesGPO = "Settings: Workstation Updates"
+
+# ------------------------------------------------------------
+# Enable Automatic Updates
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $WorkstationUpdatesGPO `
+    -Key "HKLM\Software\Policies\Microsoft\Windows\WindowsUpdate\AU" `
+    -ValueName "NoAutoUpdate" `
+    -Type DWord `
+    -Value 0 | Out-Null
+
+# ------------------------------------------------------------
+# Configure Automatic Updates: Option 4
+# Auto download and schedule the install
+# ------------------------------------------------------------
+Set-GPRegistryValue `
+    -Name $WorkstationUpdatesGPO `
+    -Key "HKLM\Software\Policies\Microsoft\Windows\WindowsUpdate\AU" `
+    -ValueName "AUOptions" `
+    -Type DWord `
+    -Value 4 | Out-Null
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Write-Host "Populated GPO: $WorkstationUpdatesGPO" -ForegroundColor Green
+
+
+##########################################
+###          Script completed          ###
+##########################################
+
+Write-Host ""
+Write-Host "==============================" -ForegroundColor Cyan
+Write-Host "=== dcconfig 2.1 completed ===" -ForegroundColor Cyan
