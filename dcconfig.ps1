@@ -10,18 +10,27 @@
 #   - GPO object creation and linking
 #   - GPO Settings
 #
-# Coding: (bad)Copilot unti v2.1, ClaudeCode since v3.0
+# Coding: (bad)Copilot until v2.1, ClaudeCode since v3.0
 # Mastermind: sp
 #
 # Version History:
 #   2.0-gold: Initial version. Creates the Active Directory baseline: OU structure, administrative groups, FGPPs, and GPO objects with linking only. No policy settings are applied.
 #   2.1: Populates all baseline GPOs with security, firewall, Defender, SMB, RDP, Windows Update, and startup reliability settings, forming the complete domain hardening configuration.
+#   3.0: Adds transcript logging, a tunables block for the FGPP values, -WhatIf support, a single up-front confirmation prompt, and consolidates GPO identity/target/link state into the $GPOs array as the single source of truth.
+#   3.1: Correctness and robustness pass. The User Policy FGPP now sets explicit lockout values (it previously inherited a threshold of 0, disabling lockout for every domain user). -WhatIf no longer errors on objects it did not create. GPO settings writes go through Set-ClkGPOValue, which catches failures so a partial run is reported as such instead of announcing success. Janitors is resolved domain-wide, DC IP resolution is guarded against an empty result, the root OU name is validated, and the transcript is closed on unhandled errors. Adds a #Requires preamble (elevation, PS 5.1, both modules), caches Get-GPInheritance per OU, and batches registry values that share a key and a type into single writes. Restores the "Starting dcconfig" / "dcconfig completed successfully" banners, both (plus the -WhatIf and failure banners) printing the running script's version, read at runtime from this Version History block so it can never drift out of sync with the one place a version is maintained.
 # ============================================================
 
 
-##############################################
-###            Version 2.0-gold            ###
-##############################################
+##################################################
+###   AD Structure, Groups, FGPPs, GPO Objects ###
+##################################################
+
+# Fail up front with a clear message rather than deep into the run with an obscure
+# access-denied or "term not recognized" error. -Modules also imports both modules,
+# so the Import-Module calls below are belt-and-braces for readability.
+#Requires -Version 5.1
+#Requires -RunAsAdministrator
+#Requires -Modules ActiveDirectory, GroupPolicy
 
 [CmdletBinding(SupportsShouldProcess)]
 param()
@@ -30,17 +39,67 @@ Import-Module ActiveDirectory
 Import-Module GroupPolicy
 
 # ============================================================
+# Script Version
+# ============================================================
+# The header's Version History block is the only place a version number is
+# maintained (see CLAUDE.md) - read the most recent entry from it rather than
+# keeping a second copy here that could drift out of sync.
+function Get-ClkScriptVersion {
+    param ([string]$Path)
+
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+
+    try {
+        $versions = Select-String -LiteralPath $Path -Pattern '^#\s+(\d+\.\d+(?:-[A-Za-z0-9]+)?):' -ErrorAction Stop |
+            ForEach-Object { $_.Matches[0].Groups[1].Value }
+        if ($versions) { return "v$($versions[-1])" }
+    }
+    catch { }
+
+    return $null
+}
+
+# $PSCommandPath is empty when the script is dot-sourced or run from a pasted
+# selection - fall back gracefully rather than failing the whole run over a banner.
+$ScriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+$ScriptVersion = Get-ClkScriptVersion -Path $ScriptPath
+if (-not $ScriptVersion) { $ScriptVersion = "(version unknown)" }
+
+# ============================================================
 # Transcript Logging
 # ============================================================
-$LogDir = Join-Path $PSScriptRoot "Logs"
+# $PSScriptRoot is empty when the script is dot-sourced or run from an editor
+# selection, which would make Join-Path throw - fall back to the current location.
+$ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+
+$LogDir = Join-Path $ScriptRoot "Logs"
 if (-not (Test-Path $LogDir)) {
     New-Item -ItemType Directory -Path $LogDir | Out-Null
 }
 $LogFile = Join-Path $LogDir ("dcconfig_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
-Start-Transcript -Path $LogFile | Out-Null
+
+try {
+    Start-Transcript -Path $LogFile -ErrorAction Stop | Out-Null
+}
+catch {
+    Write-Host "Warning: could not start transcript ($($_.Exception.Message)). Continuing without a log file." -ForegroundColor Yellow
+}
+
+# Any terminating error below would otherwise leave the transcript running in the
+# session, so that the next run fails at Start-Transcript. Close it and re-throw.
+trap {
+    Write-Host ""
+    Write-Host "Unhandled error: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "The run stopped early - the baseline is only partially applied." -ForegroundColor Red
+    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+    break
+}
 
 Write-Host ""
-Write-Host "===        dcconfig        ===" -ForegroundColor Cyan
+Write-Host "==============================" -ForegroundColor Cyan
+Write-Host "Starting dcconfig $ScriptVersion" -ForegroundColor Cyan
 Write-Host "==============================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -58,6 +117,14 @@ $DomainAdminLockoutObservationMinutes = 60
 $UserPasswordMinLength    = 8
 $UserPasswordHistoryCount = 16
 $UserMaxPasswordAgeDays   = 120
+
+# An FGPP replaces the Default Domain Policy password AND lockout settings wholesale
+# for its subjects - it is not an overlay. Leaving these unset would create the policy
+# with LockoutThreshold 0, i.e. no account lockout at all for every member of
+# Domain Users. Always set them explicitly.
+$UserLockoutThreshold          = 10
+$UserLockoutDurationMinutes    = 30
+$UserLockoutObservationMinutes = 30
 
 # ============================================================
 # Helper Functions
@@ -107,6 +174,24 @@ function New-ClkGPO {
     }
 }
 
+# Get-GPInheritance is a round-trip per call, and the link loop asks about the same
+# handful of OUs once per GPO. Cache the linked-GPO names per OU on first use; there
+# are ~22 links across 6 distinct OUs, so this turns 22 queries into 6.
+$script:GPLinkCache = @{}
+
+function Get-ClkGPOLinkNames {
+    param ([string]$TargetOU)
+
+    if (-not $script:GPLinkCache.ContainsKey($TargetOU)) {
+        $script:GPLinkCache[$TargetOU] = @(
+            (Get-GPInheritance -Target $TargetOU).GpoLinks |
+                Select-Object -ExpandProperty DisplayName
+        )
+    }
+
+    return $script:GPLinkCache[$TargetOU]
+}
+
 function New-ClkGPOLink {
     [CmdletBinding(SupportsShouldProcess)]
     param (
@@ -115,23 +200,61 @@ function New-ClkGPOLink {
         [bool]$Disabled = $false
     )
 
-    $existing = (Get-GPInheritance -Target $TargetOU).GpoLinks |
-        Where-Object { $_.DisplayName -eq $GPOName }
+    $existing = (Get-ClkGPOLinkNames $TargetOU) -contains $GPOName
 
     if (-not $existing) {
         if ($Disabled) {
             if ($PSCmdlet.ShouldProcess("$GPOName -> $TargetOU", "Link GPO (disabled)")) {
                 New-GPLink -Name $GPOName -Target $TargetOU -LinkEnabled No | Out-Null
+                $script:GPLinkCache[$TargetOU] += $GPOName
                 Write-Host "Linked (disabled): $GPOName -> $TargetOU" -ForegroundColor Yellow
             }
         }
         elseif ($PSCmdlet.ShouldProcess("$GPOName -> $TargetOU", "Link GPO")) {
             New-GPLink -Name $GPOName -Target $TargetOU | Out-Null
+            $script:GPLinkCache[$TargetOU] += $GPOName
             Write-Host "Linked: $GPOName -> $TargetOU" -ForegroundColor Green
         }
     }
     else {
         Write-Host "Link already exists: $GPOName -> $TargetOU" -ForegroundColor Gray
+    }
+}
+
+# Records how many registry writes failed, per GPO, so a partial run is reported
+# as a failure instead of printing a green "Populated" line regardless of outcome.
+$script:GPOFailures = @{}
+
+# -ValueName and -Value accept arrays, and each call is one open/commit of the GPO's
+# registry.pol. Values sharing a key AND a type can therefore be written in a single
+# call. -Type is singular, so a DWord and a String under the same key still need two.
+function Set-ClkGPOValue {
+    param (
+        [string]$Name,
+        [string]$Key,
+        [string[]]$ValueName,
+        [Microsoft.Win32.RegistryValueKind]$Type,
+        [object[]]$Value
+    )
+
+    try {
+        Set-GPRegistryValue -Name $Name -Key $Key -ValueName $ValueName -Type $Type -Value $Value -ErrorAction Stop | Out-Null
+    }
+    catch {
+        $script:GPOFailures[$Name] = $ValueName.Count + [int]$script:GPOFailures[$Name]
+        Write-Host "  FAILED: [$Name] $Key\$($ValueName -join ', ') - $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+function Confirm-GPOPopulated {
+    param ([string]$Name)
+
+    $failed = [int]$script:GPOFailures[$Name]
+    if ($failed -eq 0) {
+        Write-Host "Populated GPO: $Name" -ForegroundColor Green
+    }
+    else {
+        Write-Host "INCOMPLETE GPO: $Name ($failed setting(s) failed)" -ForegroundColor Red
     }
 }
 
@@ -142,7 +265,17 @@ $RootOUName = Read-Host "Enter the root OU name (e.g. CONTOSO, ACME)"
 
 if ([string]::IsNullOrWhiteSpace($RootOUName)) {
     Write-Host "Root OU name cannot be empty. Exiting." -ForegroundColor Red
-    Stop-Transcript | Out-Null
+    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+    return
+}
+
+# The name is interpolated into both an LDAP filter and a distinguished name, so
+# characters that are special to either (' , = + \ # < > ;) must be rejected up
+# front rather than producing a broken filter or a malformed DN that every
+# derived path below would silently inherit.
+if ($RootOUName -notmatch '^[A-Za-z0-9][A-Za-z0-9 _-]{0,62}$') {
+    Write-Host "Root OU name must start with a letter or digit and contain only letters, digits, spaces, hyphens and underscores (max 63 characters). Exiting." -ForegroundColor Red
+    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
     return
 }
 
@@ -171,12 +304,13 @@ Write-Host ""
 
 if ($WhatIfPreference) {
     Write-Host "Running with -WhatIf: no changes will actually be made. Each action will report what it would have done." -ForegroundColor Yellow
+    Write-Host "GPO linking and GPO settings population are skipped entirely, since both operate on objects that -WhatIf did not create." -ForegroundColor Yellow
     Write-Host ""
 }
 
 if (-not (Confirm-Action "Proceed?")) {
     Write-Host "Aborted by user." -ForegroundColor Red
-    Stop-Transcript | Out-Null
+    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
     return
 }
 
@@ -205,9 +339,22 @@ Write-Host ""
 $JanitorsOU = "OU=Security,$GroupsOU"
 $JanitorsGroup = "Janitors"
 
-if (-not (Get-ADGroup -Filter "Name -eq '$JanitorsGroup'" -SearchBase $JanitorsOU -ErrorAction SilentlyContinue)) {
+# sAMAccountName is unique domain-wide, so an OU-scoped existence check would miss a
+# Janitors group living elsewhere and then fail on the duplicate name. Search the whole
+# domain, and carry the resolved object forward so every later call targets that exact
+# group rather than re-resolving an ambiguous name.
+$Janitors = Get-ADGroup -Filter "Name -eq '$JanitorsGroup'" -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+
+if (-not $Janitors) {
     New-ADGroup -Name $JanitorsGroup -GroupScope Global -GroupCategory Security -Path $JanitorsOU
+    $Janitors = Get-ADGroup -Filter "Name -eq '$JanitorsGroup'" -ErrorAction SilentlyContinue |
+        Select-Object -First 1
     Write-Host "Created group: Janitors" -ForegroundColor Green
+}
+elseif ($Janitors.DistinguishedName -notlike "*,$JanitorsOU") {
+    Write-Host "Group 'Janitors' already exists outside the expected OU: $($Janitors.DistinguishedName)" -ForegroundColor Yellow
+    Write-Host "Using the existing group. Move it to $JanitorsOU manually if that is not intended." -ForegroundColor Yellow
 }
 else {
     Write-Host "Group already exists: Janitors" -ForegroundColor Gray
@@ -218,12 +365,16 @@ try {
 }
 catch {
     Write-Host "Could not resolve the current user as a domain account. This script must be run while logged on as a domain user. Exiting." -ForegroundColor Red
-    Stop-Transcript | Out-Null
+    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
     return
 }
 
-if (-not (Get-ADGroupMember -Identity $JanitorsGroup | Where-Object { $_.SID.Value -eq $CurrentUser.SID.Value })) {
-    Add-ADGroupMember -Identity $JanitorsGroup -Members $CurrentUser
+# Under -WhatIf the group was never created, so there is nothing to enumerate.
+if (-not $Janitors) {
+    Write-Host "What if: Adding current user to Janitors" -ForegroundColor Gray
+}
+elseif (-not (Get-ADGroupMember -Identity $Janitors | Where-Object { $_.SID.Value -eq $CurrentUser.SID.Value })) {
+    Add-ADGroupMember -Identity $Janitors -Members $CurrentUser
     Write-Host "Added current user to Janitors" -ForegroundColor Green
 }
 else {
@@ -233,7 +384,9 @@ else {
 # ============================================================
 # Move User to Admins OU
 # ============================================================
-if ($CurrentUser.DistinguishedName -notlike "*OU=Admins,*") {
+# Match the Admins OU under this root specifically - "*OU=Admins,*" would also match
+# an Admins OU under some other root and skip the move.
+if ($CurrentUser.DistinguishedName -notlike "*,$AdminsOU") {
     Move-ADObject -Identity $CurrentUser.DistinguishedName -TargetPath $AdminsOU
     Write-Host "Moved user to Admins OU" -ForegroundColor Green
 }
@@ -261,8 +414,13 @@ else {
     Write-Host "FGPP already exists: Domain Admin Policy" -ForegroundColor Gray
 }
 
-if (-not (Get-ADFineGrainedPasswordPolicySubject -Identity "Domain Admin Policy" | Where-Object { $_.Name -eq "Janitors" })) {
-    Add-ADFineGrainedPasswordPolicySubject -Identity "Domain Admin Policy" -Subjects "Janitors"
+# Guarded on the policy existing: under -WhatIf it was never created, and querying
+# subjects of a missing policy is a terminating error.
+if (-not $Janitors -or -not (Get-ADFineGrainedPasswordPolicy -Filter "Name -eq 'Domain Admin Policy'")) {
+    Write-Host "What if: Adding Janitors as subject of Domain Admin Policy" -ForegroundColor Gray
+}
+elseif (-not (Get-ADFineGrainedPasswordPolicySubject -Identity "Domain Admin Policy" | Where-Object { $_.SID.Value -eq $Janitors.SID.Value })) {
+    Add-ADFineGrainedPasswordPolicySubject -Identity "Domain Admin Policy" -Subjects $Janitors
     Write-Host "Added Janitors as subject of Domain Admin Policy" -ForegroundColor Green
 }
 else {
@@ -276,14 +434,20 @@ if (-not (Get-ADFineGrainedPasswordPolicy -Filter "Name -eq 'User Policy'")) {
         -MinPasswordLength $UserPasswordMinLength `
         -PasswordHistoryCount $UserPasswordHistoryCount `
         -ComplexityEnabled $true `
-        -MaxPasswordAge (New-TimeSpan -Days $UserMaxPasswordAgeDays)
+        -MaxPasswordAge (New-TimeSpan -Days $UserMaxPasswordAgeDays) `
+        -LockoutThreshold $UserLockoutThreshold `
+        -LockoutDuration (New-TimeSpan -Minutes $UserLockoutDurationMinutes) `
+        -LockoutObservationWindow (New-TimeSpan -Minutes $UserLockoutObservationMinutes)
     Write-Host "Created FGPP: User Policy" -ForegroundColor Green
 }
 else {
     Write-Host "FGPP already exists: User Policy" -ForegroundColor Gray
 }
 
-if (-not (Get-ADFineGrainedPasswordPolicySubject -Identity "User Policy" | Where-Object { $_.Name -eq "Domain Users" })) {
+if (-not (Get-ADFineGrainedPasswordPolicy -Filter "Name -eq 'User Policy'")) {
+    Write-Host "What if: Adding Domain Users as subject of User Policy" -ForegroundColor Gray
+}
+elseif (-not (Get-ADFineGrainedPasswordPolicySubject -Identity "User Policy" | Where-Object { $_.Name -eq "Domain Users" })) {
     Add-ADFineGrainedPasswordPolicySubject -Identity "User Policy" -Subjects "Domain Users"
     Write-Host "Added Domain Users as subject of User Policy" -ForegroundColor Green
 }
@@ -309,6 +473,8 @@ $GPOs = @(
     [PSCustomObject]@{ Name = "Security: Disable AutoPlay";          TargetOU = @($ComputersOU);        Disabled = $false }
     [PSCustomObject]@{ Name = "Security: SMB Hardening";             TargetOU = @($ComputersOU);        Disabled = $false }
     [PSCustomObject]@{ Name = "Settings: Wait for network";          TargetOU = @($ComputersOU);        Disabled = $false }
+    # Intentionally at the Computers OU: RDP is enabled on workstations as well as
+    # servers, and who may actually reach it is controlled by the firewall GPOs below.
     [PSCustomObject]@{ Name = "Settings: Enable RDP";                TargetOU = @($ComputersOU);        Disabled = $false }
     [PSCustomObject]@{ Name = "Settings: NoSleep";                   TargetOU = @($WorkstationsOU);     Disabled = $true  }
     [PSCustomObject]@{ Name = "Settings: Workstation Updates";       TargetOU = @($WorkstationsOU);     Disabled = $false }
@@ -326,6 +492,23 @@ foreach ($gpo in $GPOs) {
 }
 
 # ============================================================
+# -WhatIf stops here
+# ============================================================
+# Everything below reads or writes the GPOs and OUs created above:
+# Get-GPInheritance needs the target OU to exist, and Set-GPRegistryValue needs the
+# GPO to exist. Under -WhatIf neither does, so continuing would only produce a wall
+# of errors while still printing success lines.
+if ($WhatIfPreference) {
+    Write-Host ""
+    Write-Host "-WhatIf: skipping GPO linking and settings population (both require the objects above to exist)." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "==============================" -ForegroundColor Cyan
+    Write-Host "dcconfig $ScriptVersion -WhatIf ended" -ForegroundColor Cyan
+    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+    return
+}
+
+# ============================================================
 # GPO Linking (NO SETTINGS)
 # ============================================================
 Write-Host ""
@@ -340,7 +523,7 @@ foreach ($gpo in $GPOs) {
 
 
 #########################################
-###            Version 2.1            ###
+###       GPO Settings Population     ###
 #########################################
 
 Write-Host ""
@@ -363,28 +546,41 @@ $FirewallEnableGPO = "Security: Enable Firewall"
 $Profiles = @("DomainProfile", "PrivateProfile", "PublicProfile")
 
 foreach ($FWProfile in $Profiles) {
-    Set-GPRegistryValue `
+    Set-ClkGPOValue `
         -Name $FirewallEnableGPO `
         -Key "HKLM\Software\Policies\Microsoft\WindowsFirewall\$FWProfile" `
         -ValueName "EnableFirewall" `
         -Type DWord `
-        -Value 1 | Out-Null
+        -Value 1
 }
 
 # ------------------------------------------------------------
 # Confirm settings population
 # ------------------------------------------------------------
-Write-Host "Populated GPO: $FirewallEnableGPO" -ForegroundColor Green
+Confirm-GPOPopulated $FirewallEnableGPO
 
 
 # ------------------------------------------------------------
 # Resolve DC IPv4 addresses (static snapshot, matches .pol/ADMX behavior)
 # Shared by the Server and Workstation firewall rule blocks below,
 # which both scope their exceptions to these same DC IPs.
+#
+# This is the intended state for a fresh domain: remote administration, file sharing
+# and RDP are reachable only from a DC. Admin workstation IPs are to be added to
+# $DCIPString (or to the RemoteAddresses scopes directly) later, at which point those
+# machines can manage and RDP into servers and workstations too.
 # ------------------------------------------------------------
 $DCIPs = Get-ADDomainController -Filter * |
     Select-Object -ExpandProperty IPv4Address |
     Where-Object { $_ }
+
+# An empty scope here would be written into the remote administration, file sharing
+# and Remote Desktop exceptions below. Combined with EnableFirewall above, that can
+# leave every server and workstation in the tree unreachable for management, so stop
+# rather than apply it.
+if (-not $DCIPs) {
+    throw "Could not resolve any domain controller IPv4 address. Refusing to write empty RemoteAddresses scopes into the firewall GPOs."
+}
 
 $DCIPString = ($DCIPs -join ",")
 
@@ -404,71 +600,71 @@ $ServerFirewallGPO = "Firewall: Default Server Rules"
 # Allow ICMP exceptions → Allow inbound echo request
 # (.pol: DomainProfile\IcmpSettings)
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $ServerFirewallGPO `
     -Key "$DomainProfileKey\IcmpSettings" `
     -ValueName "AllowInboundEchoRequest" `
     -Type DWord `
-    -Value 1 | Out-Null
+    -Value 1
 
 # ------------------------------------------------------------
 # Allow inbound remote administration exception (DC IP only)
 # (.pol: DomainProfile\RemoteAdminSettings)
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $ServerFirewallGPO `
     -Key "$DomainProfileKey\RemoteAdminSettings" `
     -ValueName "Enabled" `
     -Type DWord `
-    -Value 1 | Out-Null
+    -Value 1
 
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $ServerFirewallGPO `
     -Key "$DomainProfileKey\RemoteAdminSettings" `
     -ValueName "RemoteAddresses" `
     -Type String `
-    -Value $DCIPString | Out-Null
+    -Value $DCIPString
 
 # ------------------------------------------------------------
 # Allow inbound file and printer sharing (DC IP only)
 # (.pol: DomainProfile\Services\FileAndPrint)
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $ServerFirewallGPO `
     -Key "$DomainProfileKey\Services\FileAndPrint" `
     -ValueName "Enabled" `
     -Type DWord `
-    -Value 1 | Out-Null
+    -Value 1
 
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $ServerFirewallGPO `
     -Key "$DomainProfileKey\Services\FileAndPrint" `
     -ValueName "RemoteAddresses" `
     -Type String `
-    -Value $DCIPString | Out-Null
+    -Value $DCIPString
 
 # ------------------------------------------------------------
 # Allow inbound Remote Desktop exceptions (DC IP only)
 # (.pol: DomainProfile\Services\RemoteDesktop)
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $ServerFirewallGPO `
     -Key "$DomainProfileKey\Services\RemoteDesktop" `
     -ValueName "Enabled" `
     -Type DWord `
-    -Value 1 | Out-Null
+    -Value 1
 
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $ServerFirewallGPO `
     -Key "$DomainProfileKey\Services\RemoteDesktop" `
     -ValueName "RemoteAddresses" `
     -Type String `
-    -Value $DCIPString | Out-Null
+    -Value $DCIPString
 
 # ------------------------------------------------------------
 # Confirm settings population
 # ------------------------------------------------------------
-Write-Host "Populated GPO: $ServerFirewallGPO" -ForegroundColor Green
+Confirm-GPOPopulated $ServerFirewallGPO
 
 
 ###
@@ -485,68 +681,68 @@ $WorkstationFirewallGPO = "Firewall: Default Workstation Rules"
 # Allow ICMP exceptions → Allow inbound echo request
 # (uses $DCIPString/$DomainProfileKey resolved above, shared with the Server Rules block)
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $WorkstationFirewallGPO `
     -Key "$DomainProfileKey\IcmpSettings" `
     -ValueName "AllowInboundEchoRequest" `
     -Type DWord `
-    -Value 1 | Out-Null
+    -Value 1
 
 # ------------------------------------------------------------
 # Allow inbound remote administration exception (DC IP only)
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $WorkstationFirewallGPO `
     -Key "$DomainProfileKey\RemoteAdminSettings" `
     -ValueName "Enabled" `
     -Type DWord `
-    -Value 1 | Out-Null
+    -Value 1
 
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $WorkstationFirewallGPO `
     -Key "$DomainProfileKey\RemoteAdminSettings" `
     -ValueName "RemoteAddresses" `
     -Type String `
-    -Value $DCIPString | Out-Null
+    -Value $DCIPString
 
 # ------------------------------------------------------------
 # Allow inbound file and printer sharing (DC IP only)
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $WorkstationFirewallGPO `
     -Key "$DomainProfileKey\Services\FileAndPrint" `
     -ValueName "Enabled" `
     -Type DWord `
-    -Value 1 | Out-Null
+    -Value 1
 
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $WorkstationFirewallGPO `
     -Key "$DomainProfileKey\Services\FileAndPrint" `
     -ValueName "RemoteAddresses" `
     -Type String `
-    -Value $DCIPString | Out-Null
+    -Value $DCIPString
 
 # ------------------------------------------------------------
 # Allow inbound Remote Desktop exceptions (DC IP only)
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $WorkstationFirewallGPO `
     -Key "$DomainProfileKey\Services\RemoteDesktop" `
     -ValueName "Enabled" `
     -Type DWord `
-    -Value 1 | Out-Null
+    -Value 1
 
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $WorkstationFirewallGPO `
     -Key "$DomainProfileKey\Services\RemoteDesktop" `
     -ValueName "RemoteAddresses" `
     -Type String `
-    -Value $DCIPString | Out-Null
+    -Value $DCIPString
 
 # ------------------------------------------------------------
 # Confirm settings population
 # ------------------------------------------------------------
-Write-Host "Populated GPO: $WorkstationFirewallGPO" -ForegroundColor Green
+Confirm-GPOPopulated $WorkstationFirewallGPO
 
 
 ###
@@ -565,61 +761,51 @@ $BaseKey = "HKLM\Software\Policies\Microsoft\Windows Defender"
 # Turn on Microsoft Defender Antivirus
 # Policy: Turn off Microsoft Defender Antivirus = Disabled
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $DefenderGPO `
     -Key $BaseKey `
     -ValueName "DisableAntiSpyware" `
     -Type DWord `
-    -Value 0 | Out-Null
+    -Value 0
 
 # ------------------------------------------------------------
 # Enable real-time protection
 # Policy: Turn on real-time protection = Enabled
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $DefenderGPO `
     -Key "$BaseKey\Real-Time Protection" `
     -ValueName "DisableRealtimeMonitoring" `
     -Type DWord `
-    -Value 0 | Out-Null
+    -Value 0
 
 # ------------------------------------------------------------
-# Enable cloud-delivered protection
-# Policy: Turn on cloud-delivered protection = Enabled
+# MAPS / cloud protection (same key, same type - written in one call)
+# Policy: Turn on cloud-delivered protection = Enabled  (SpynetReporting = 2)
+# Policy: Send file samples when further analysis is required (SubmitSamplesConsent = 1)
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $DefenderGPO `
     -Key "$BaseKey\Spynet" `
-    -ValueName "SpynetReporting" `
+    -ValueName "SpynetReporting", "SubmitSamplesConsent" `
     -Type DWord `
-    -Value 2 | Out-Null
-
-# ------------------------------------------------------------
-# Enable automatic sample submission
-# Policy: Send file samples when further analysis is required
-# ------------------------------------------------------------
-Set-GPRegistryValue `
-    -Name $DefenderGPO `
-    -Key "$BaseKey\Spynet" `
-    -ValueName "SubmitSamplesConsent" `
-    -Type DWord `
-    -Value 1 | Out-Null
+    -Value 2, 1
 
 # ------------------------------------------------------------
 # Enable Potentially Unwanted Application (PUA) protection
 # Policy: Configure detection for potentially unwanted applications = Enabled (Block)
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $DefenderGPO `
     -Key "HKLM\Software\Policies\Microsoft\Windows Defender" `
     -ValueName "PUAProtection" `
     -Type DWord `
-    -Value 1 | Out-Null
+    -Value 1
 
 # ------------------------------------------------------------
 # Confirm settings population
 # ------------------------------------------------------------
-Write-Host "Populated GPO: $DefenderGPO" -ForegroundColor Green
+Confirm-GPOPopulated $DefenderGPO
 
 
 ###
@@ -632,41 +818,33 @@ Write-Host "Populated GPO: $DefenderGPO" -ForegroundColor Green
 $AutoPlayGPO = "Security: Disable AutoPlay"
 
 # ------------------------------------------------------------
-# Set the default behavior for AutoRun = Enabled
-# Default AutoRun Behavior: Do not execute any autorun commands
+# Explorer AutoRun policies (same key, same type - written in one call)
+# Policy: Set the default behavior for AutoRun = Enabled
+#         Default AutoRun Behavior: Do not execute any autorun commands (NoAutorun = 1)
+# Policy: Turn off AutoPlay = Enabled
+#         Turn off AutoPlay on: All drives (NoDriveTypeAutoRun = 255)
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $AutoPlayGPO `
     -Key "HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" `
-    -ValueName "NoAutorun" `
+    -ValueName "NoAutorun", "NoDriveTypeAutoRun" `
     -Type DWord `
-    -Value 1 | Out-Null
-
-# ------------------------------------------------------------
-# Turn off AutoPlay = Enabled
-# Turn off AutoPlay on: All drives
-# ------------------------------------------------------------
-Set-GPRegistryValue `
-    -Name $AutoPlayGPO `
-    -Key "HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" `
-    -ValueName "NoDriveTypeAutoRun" `
-    -Type DWord `
-    -Value 255 | Out-Null
+    -Value 1, 255
 
 # ------------------------------------------------------------
 # Disallow AutoPlay for non-volume devices = Enabled
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $AutoPlayGPO `
     -Key "HKLM\Software\Policies\Microsoft\Windows\Explorer" `
     -ValueName "NoAutoplayfornonVolume" `
     -Type DWord `
-    -Value 1 | Out-Null
+    -Value 1
 
 # ------------------------------------------------------------
 # Confirm settings population
 # ------------------------------------------------------------
-Write-Host "Populated GPO: $AutoPlayGPO" -ForegroundColor Green
+Confirm-GPOPopulated $AutoPlayGPO
 
 
 ###
@@ -686,39 +864,39 @@ $SmbHardeningGPO = "Security: SMB Hardening"
 # Disable Computer Browser service
 # System Services → Computer Browser → Startup Mode: Disabled
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $SmbHardeningGPO `
     -Key "HKLM\SYSTEM\CurrentControlSet\Services\Browser" `
     -ValueName "Start" `
     -Type DWord `
-    -Value 4 | Out-Null
+    -Value 4
 
 # ------------------------------------------------------------
 # Disable SMBv1 protocol (Lanman Server)
 # Administrative Templates → Network → Lanman Server
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $SmbHardeningGPO `
     -Key "HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" `
     -ValueName "SMB1" `
     -Type DWord `
-    -Value 0 | Out-Null
+    -Value 0
 
 # ------------------------------------------------------------
 # Disable insecure guest logons (Lanman Workstation)
 # Administrative Templates → Network → Lanman Workstation
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $SmbHardeningGPO `
     -Key "HKLM\Software\Policies\Microsoft\Windows\LanmanWorkstation" `
     -ValueName "AllowInsecureGuestAuth" `
     -Type DWord `
-    -Value 0 | Out-Null
+    -Value 0
 
 # ------------------------------------------------------------
 # Confirm settings population
 # ------------------------------------------------------------
-Write-Host "Populated GPO: $SmbHardeningGPO" -ForegroundColor Green
+Confirm-GPOPopulated $SmbHardeningGPO
 
 
 ###
@@ -732,29 +910,21 @@ Write-Host "Populated GPO: $SmbHardeningGPO" -ForegroundColor Green
 $WaitForNetworkGPO = "Settings: Wait for network"
 
 # ------------------------------------------------------------
-# Always wait for the network at startup and logon
+# Always wait for the network at computer startup and logon
+# SyncForegroundPolicy IS the registry backing for that ADMX policy - there is no
+# separate "AlwaysWaitForNetworkAtStartupAndLogon" value to set.
 # ------------------------------------------------------------
-#Set-GPRegistryValue `
-#   -Name $WaitForNetworkGPO `
-#    -Key "HKLM\Software\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon" `
-#    -ValueName "AlwaysWaitForNetworkAtStartupAndLogon" `
-#    -Type DWord `
-#    -Value 1
-
-# ------------------------------------------------------------
-# Synchronous foreground policy processing (required by ADMX)
-# ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $WaitForNetworkGPO `
     -Key "HKLM\Software\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon" `
     -ValueName "SyncForegroundPolicy" `
     -Type DWord `
-    -Value 1 | Out-Null
+    -Value 1
 
 # ------------------------------------------------------------
 # Confirm settings population
 # ------------------------------------------------------------
-Write-Host "Populated GPO: $WaitForNetworkGPO" -ForegroundColor Green
+Confirm-GPOPopulated $WaitForNetworkGPO
 
 
 ###
@@ -770,29 +940,28 @@ Write-Host "Populated GPO: $WaitForNetworkGPO" -ForegroundColor Green
 $EnableRdpGPO = "Settings: Enable RDP"
 
 # ------------------------------------------------------------
-# Allow users to connect remotely using Remote Desktop Services
+# Terminal Services policies (same key, same type - written in one call)
+# Policy: Allow users to connect remotely using Remote Desktop Services
+#         (fDenyTSConnections = 0)
+# Policy: Require Network Level Authentication (UserAuthentication = 1)
+#
+# This GPO is linked at the Computers OU, so RDP is enabled on workstations as well
+# as servers. Reachability is deliberately controlled by the firewall GPOs rather
+# than here: the RemoteDesktop exception is scoped to the DC IPs resolved at run
+# time, so only a DC can currently connect. Admin workstation IPs are to be added
+# to that scope later.
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $EnableRdpGPO `
     -Key "HKLM\Software\Policies\Microsoft\Windows NT\Terminal Services" `
-    -ValueName "fDenyTSConnections" `
+    -ValueName "fDenyTSConnections", "UserAuthentication" `
     -Type DWord `
-    -Value 0 | Out-Null
-
-# ------------------------------------------------------------
-# Require Network Level Authentication (NLA)
-# ------------------------------------------------------------
-Set-GPRegistryValue `
-    -Name $EnableRdpGPO `
-    -Key "HKLM\Software\Policies\Microsoft\Windows NT\Terminal Services" `
-    -ValueName "UserAuthentication" `
-    -Type DWord `
-    -Value 1 | Out-Null
+    -Value 0, 1
 
 # ------------------------------------------------------------
 # Confirm settings population
 # ------------------------------------------------------------
-Write-Host "Populated GPO: $EnableRdpGPO" -ForegroundColor Green
+Confirm-GPOPopulated $EnableRdpGPO
 
 
 ###
@@ -807,41 +976,45 @@ Write-Host "Populated GPO: $EnableRdpGPO" -ForegroundColor Green
 $WorkstationUpdatesGPO = "Settings: Workstation Updates"
 
 # ------------------------------------------------------------
-# Enable Automatic Updates
+# Automatic Updates policies (same key, same type - written in one call)
+# Policy: Enable Automatic Updates (NoAutoUpdate = 0)
+# Policy: Configure Automatic Updates: Option 4 (AUOptions = 4)
+#         Auto download and schedule the install
 # ------------------------------------------------------------
-Set-GPRegistryValue `
+Set-ClkGPOValue `
     -Name $WorkstationUpdatesGPO `
     -Key "HKLM\Software\Policies\Microsoft\Windows\WindowsUpdate\AU" `
-    -ValueName "NoAutoUpdate" `
+    -ValueName "NoAutoUpdate", "AUOptions" `
     -Type DWord `
-    -Value 0 | Out-Null
-
-# ------------------------------------------------------------
-# Configure Automatic Updates: Option 4
-# Auto download and schedule the install
-# ------------------------------------------------------------
-Set-GPRegistryValue `
-    -Name $WorkstationUpdatesGPO `
-    -Key "HKLM\Software\Policies\Microsoft\Windows\WindowsUpdate\AU" `
-    -ValueName "AUOptions" `
-    -Type DWord `
-    -Value 4 | Out-Null
+    -Value 0, 4
 
 # ------------------------------------------------------------
 # Confirm settings population
 # ------------------------------------------------------------
-Write-Host "Populated GPO: $WorkstationUpdatesGPO" -ForegroundColor Green
+Confirm-GPOPopulated $WorkstationUpdatesGPO
 
 
 ##########################################
 ###          Script completed          ###
 ##########################################
 
+$TotalFailures = ($script:GPOFailures.Values | Measure-Object -Sum).Sum
+
 Write-Host ""
 Write-Host "==============================" -ForegroundColor Cyan
-Write-Host "=== dcconfig 2.1 completed ===" -ForegroundColor Cyan
+if ($TotalFailures) {
+    Write-Host "dcconfig $ScriptVersion completed with errors" -ForegroundColor Red
+    Write-Host "$TotalFailures GPO setting(s) failed to apply across $($script:GPOFailures.Count) GPO(s):" -ForegroundColor Red
+    foreach ($entry in $script:GPOFailures.GetEnumerator()) {
+        Write-Host "  - $($entry.Key): $($entry.Value) failure(s)" -ForegroundColor Red
+    }
+    Write-Host "Review the log at $LogFile and re-run once the cause is fixed." -ForegroundColor Red
+}
+else {
+    Write-Host "dcconfig $ScriptVersion completed successfully" -ForegroundColor Cyan
+}
 
-Stop-Transcript | Out-Null
+Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 
 
 

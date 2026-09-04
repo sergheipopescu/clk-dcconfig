@@ -3,8 +3,8 @@
 REM Resolve the directory where this BAT file lives
 set SCRIPT_DIR=%~dp0
 
-REM Find the newest dcconfig script (with or without version)
-for /f "delims=" %%F in ('dir /b /o:-d "%SCRIPT_DIR%dcconfig*.ps1" 2^>nul') do (
+REM Find the highest-named dcconfig script (name sort, descending)
+for /f "delims=" %%F in ('dir /b /o:-n "%SCRIPT_DIR%dcconfig*.ps1" 2^>nul') do (
     set PS_SCRIPT=%%F
     goto :found
 )
