@@ -9,6 +9,7 @@
 #   - Fine-Grained Password Policies
 #   - GPO object creation and linking
 #   - GPO Settings
+#   - ADMX Central Store import (delegated to admxupdate.ps1, which also stands alone)
 #
 # Assumption: this runs once, interactively, on a freshly promoted DC that is the
 # only DC in the domain at that point. AD/GPO cmdlets below are therefore not pinned
@@ -26,6 +27,7 @@
 #   3.1: Correctness and robustness pass. The User Policy FGPP now sets explicit lockout values (it previously inherited a threshold of 0, disabling lockout for every domain user). -WhatIf no longer errors on objects it did not create. GPO settings writes go through Set-ClkGPOValue, which catches failures so a partial run is reported as such instead of announcing success. Janitors is resolved domain-wide, DC IP resolution is guarded against an empty result, the root OU name is validated, and the transcript is closed on unhandled errors. Adds a #Requires preamble (elevation, PS 5.1, both modules), caches Get-GPInheritance per OU, and batches registry values that share a key and a type into single writes. Restores the "Starting dcconfig" / "dcconfig completed successfully" banners, both (plus the -WhatIf and failure banners) printing the running script's version, read at runtime from this Version History block so it can never drift out of sync with the one place a version is maintained.
 #   3.2: Redirects the default computer/user containers via redircmp/redirusr so objects created without an explicit OU (a domain-joined computer, a bare net user) land in the Workstations and Users OUs instead of the invisible-to-GPO CN=Computers/CN=Users containers. Adds a "Settings: GP Refresh" GPO, linked to the Servers and Computers OUs, setting the Group Policy refresh interval to 15 minutes.
 #   3.3: Adds a "Deploy: ESMC" GPO, linked (disabled) to the Computers and Servers OUs, as an empty placeholder for future ESET ESMC deployment settings. New-ClkGPOLink now reconciles an existing link's enabled state instead of only checking that the link exists, so changing a $GPOs entry's Disabled flag takes effect on a re-run rather than being silently ignored on a domain the script has already configured. Populates and enables three GPOs that were previously created empty with their links disabled: "Firewall: Allow from DC" and "Firewall: Allow from Clickwork HQ" (192.168.10.5/32) now get inbound allow-any rules written into their Windows Defender Firewall with Advanced Security store via the new Set-ClkGPOFirewallRule helper - the legacy WindowsFirewall ADMX used by the other firewall GPOs cannot express an all-ports rule scoped to an address - and "Settings: NoSleep" gets the plugged-in sleep and hibernate timeouts set to never. "Settings: EDGE Policies" is populated and enabled too, as user-configuration values under HKCU\Software\Policies\Microsoft\Edge; these render as Extra Registry Settings until msedge.admx is imported into the Central Store, after which the same values start displaying as named policies with no rewrite. Adds NetSecurity to the #Requires module list.
+#   3.4: Adds admxupdate.ps1, a second script that imports the current Windows 11, Office, Edge and Chrome ADMX/ADML templates into the domain's Group Policy Central Store, so the policies this script writes render as named policies in GPMC rather than as Extra Registry Settings. It stands alone - it is the one to re-run on other DCs, or when a new Windows release ships, since the Central Store is a single replicated path rather than per-DC state - and dcconfig.ps1 also calls it as its final step with -Embedded, which suppresses its prompt, transcript and banners and hands back a failure count for the completion banner to report separately from the GPO tally. Placed last because nothing above depends on it: registry.pol records no reference to any ADMX, so the Central Store only decides how already-correct settings display. New -SkipCentralStore switch leaves it out, and a missing admxupdate.ps1 is a warning rather than a failure, so dcconfig.ps1 still works when it is the only file copied to a DC.
 # ============================================================
 
 
@@ -41,7 +43,12 @@
 #Requires -Modules ActiveDirectory, GroupPolicy, NetSecurity
 
 [CmdletBinding(SupportsShouldProcess)]
-param()
+param (
+    # Skip the ADMX Central Store import at the end of the run. For a DC with no
+    # outbound internet access, or when the templates are being managed separately -
+    # admxupdate.ps1 can always be run on its own later.
+    [switch]$SkipCentralStore
+)
 
 Import-Module ActiveDirectory
 Import-Module GroupPolicy
@@ -60,8 +67,12 @@ function Get-ClkScriptVersion {
     }
 
     try {
-        $versions = Select-String -LiteralPath $Path -Pattern '^#\s+(\d+\.\d+(?:-[A-Za-z0-9]+)?):' -ErrorAction Stop |
-            ForEach-Object { $_.Matches[0].Groups[1].Value }
+        # @() matters: with a single Version History entry the pipeline returns a bare
+        # string, and [-1] on a string is its last character - so this would report
+        # "v0" for a 1.0 header rather than "v1.0". Latent here (this header has had
+        # several entries since the helper was written), real in admxupdate.ps1.
+        $versions = @(Select-String -LiteralPath $Path -Pattern '^#\s+(\d+\.\d+(?:-[A-Za-z0-9]+)?):' -ErrorAction Stop |
+            ForEach-Object { $_.Matches[0].Groups[1].Value })
         if ($versions) { return "v$($versions[-1])" }
     }
     catch { }
@@ -400,11 +411,16 @@ Write-Host "  - 'Janitors' admin group, with the current user added as a member"
 Write-Host "  - Current user moved to the Admins OU"
 Write-Host "  - Fine-Grained Password Policies for admins and users"
 Write-Host "  - Baseline GPOs, created, linked to their target OUs, and populated with security/firewall/Defender/SMB/RDP/Update settings"
+if (-not $SkipCentralStore) {
+    Write-Host "  - Current Windows 11 / Office / Edge / Chrome ADMX templates imported into the domain's Group Policy Central Store"
+    Write-Host "    (via admxupdate.ps1, as the last step - downloads roughly 170 MB; pass -SkipCentralStore to leave it out)"
+}
 Write-Host ""
 
 if ($WhatIfPreference) {
     Write-Host "Running with -WhatIf: no changes will actually be made. Each action will report what it would have done." -ForegroundColor Yellow
     Write-Host "GPO linking and GPO settings population are skipped entirely, since both operate on objects that -WhatIf did not create." -ForegroundColor Yellow
+    Write-Host "The Central Store import is skipped with them - run admxupdate.ps1 -WhatIf directly to see what it would fetch." -ForegroundColor Yellow
     Write-Host ""
 }
 
@@ -1337,6 +1353,67 @@ Set-ClkGPOValue `
 Confirm-GPOPopulated $EdgeGPO
 
 
+# ============================================================
+# Group Policy Central Store
+# ============================================================
+# Deliberately last. Nothing above depends on it - a registry.pol records no
+# reference to any ADMX, so the settings written above are already correct and the
+# Central Store only decides how they display in GPMC. Running it here means the
+# whole AD baseline is already in place before the run spends several minutes on
+# ~170 MB of downloads, and a DC with no outbound internet ends with a warning
+# rather than a baseline that never got applied.
+#
+# admxupdate.ps1 is a standalone script in its own right (it is the one to re-run on
+# other DCs, or when a new Windows release ships) - -Embedded only tells it that this
+# script has already prompted, is already transcribing, and will report the outcome.
+# It is called rather than dot-sourced on purpose: dot-sourcing would overwrite
+# $ScriptVersion, $ScriptRoot and $LogFile in this scope with its own.
+#
+# -Language is left at its en-US default here. To import a different one, run
+# admxupdate.ps1 directly - the .admx copy is idempotent, so it can be run once per
+# language without undoing the previous pass.
+$AdmxFailures = 0
+
+if ($SkipCentralStore) {
+    Write-Host ""
+    Write-Host "Skipping the Central Store import (-SkipCentralStore)." -ForegroundColor Yellow
+}
+else {
+    $AdmxScript = Join-Path $ScriptRoot "admxupdate.ps1"
+
+    if (-not (Test-Path -LiteralPath $AdmxScript)) {
+        # This script has to keep working when it is the only file copied to a DC,
+        # so a missing admxupdate.ps1 is a warning, not a failure.
+        Write-Host ""
+        Write-Host "admxupdate.ps1 not found next to this script - skipping the Central Store import." -ForegroundColor Yellow
+        Write-Host "Copy it alongside dcconfig.ps1 and run it separately to import the ADMX templates." -ForegroundColor Yellow
+    }
+    else {
+        # Caught here rather than left to the trap at the top of this script. An
+        # unhandled error inside admxupdate.ps1 rethrows out of its own trap, which
+        # would take this script down with it - ending the run with no completion
+        # banner at all, even though every AD and GPO step above already succeeded.
+        # The whole point of tallying the import separately is that it cannot make a
+        # good baseline look broken, and that has to hold when it crashes too.
+        try {
+            # Select the result object rather than trusting the call to emit exactly
+            # one thing, so a stray line of pipeline output inside admxupdate.ps1
+            # could never be mistaken for its verdict.
+            $AdmxResult = & $AdmxScript -Embedded |
+                Where-Object { $_.PSObject.Properties.Name -contains "Failures" } |
+                Select-Object -Last 1
+
+            $AdmxFailures = [int]$AdmxResult.Failures
+        }
+        catch {
+            Write-Host ""
+            Write-Host "The Central Store import stopped on an unhandled error: $($_.Exception.Message)" -ForegroundColor Red
+            $AdmxFailures = 1
+        }
+    }
+}
+
+
 ##########################################
 ###          Script completed          ###
 ##########################################
@@ -1345,12 +1422,24 @@ $TotalFailures = ($script:GPOFailures.Values | Measure-Object -Sum).Sum
 
 Write-Host ""
 Write-Host "==============================" -ForegroundColor Cyan
-if ($TotalFailures) {
+if ($TotalFailures -or $AdmxFailures) {
     Write-Host "dcconfig $ScriptVersion completed with errors" -ForegroundColor Red
-    Write-Host "$TotalFailures GPO setting(s) failed to apply across $($script:GPOFailures.Count) GPO(s):" -ForegroundColor Red
-    foreach ($entry in $script:GPOFailures.GetEnumerator()) {
-        Write-Host "  - $($entry.Key): $($entry.Value) failure(s)" -ForegroundColor Red
+
+    if ($TotalFailures) {
+        Write-Host "$TotalFailures GPO setting(s) failed to apply across $($script:GPOFailures.Count) GPO(s):" -ForegroundColor Red
+        foreach ($entry in $script:GPOFailures.GetEnumerator()) {
+            Write-Host "  - $($entry.Key): $($entry.Value) failure(s)" -ForegroundColor Red
+        }
     }
+
+    # Tallied separately from the GPO failures on purpose: the two fail for unrelated
+    # reasons, and an ADMX import that could not reach the internet says nothing about
+    # whether the domain itself was configured correctly.
+    if ($AdmxFailures) {
+        Write-Host "$AdmxFailures Central Store failure(s) - the AD baseline above is unaffected." -ForegroundColor Red
+        Write-Host "Re-run admxupdate.ps1 on its own once the cause is fixed; it overwrites what did import." -ForegroundColor Red
+    }
+
     Write-Host "Review the log at $LogFile and re-run once the cause is fixed." -ForegroundColor Red
 }
 else {
@@ -1370,10 +1459,11 @@ Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 # A registry.pol value renders as a named policy if and only if a loaded ADMX defines
 # that exact key and value name, so that test decides where each of these can go.
 #
-# - Settings: EDGE Policies is populated but still owes a verification pass: import
-#   msedge.admx/.adml into the Central Store, then open the GPO once. Anything left
-#   under Extra Registry Settings is a name or type that does not match its policy
-#   and needs correcting in the block above.
+# - Settings: EDGE Policies is populated but still owes a verification pass. The
+#   Central Store step above now imports msedge.admx/.adml, so the pass is just:
+#   after a run, open that GPO once. Anything left under Extra Registry Settings is
+#   a name or type that does not match its policy and needs correcting in the block
+#   above.
 #
 # - Security: Ctrl+Alt+Del and Customization: Regional / Explorer. No ADMX exists for
 #   any of these values. DisableCAD is a Security Option (GptTmpl.inf); the Explorer
