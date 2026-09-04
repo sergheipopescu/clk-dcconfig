@@ -10,6 +10,12 @@
 #   - GPO object creation and linking
 #   - GPO Settings
 #
+# Assumption: this runs once, interactively, on a freshly promoted DC that is the
+# only DC in the domain at that point. AD/GPO cmdlets below are therefore not pinned
+# to a specific -Server - there is nothing else for them to land on, so no cross-DC
+# replication lag is possible at run time. If this script is ever run against a
+# domain that already has multiple DCs, add -Server $DC pinning throughout first.
+#
 # Coding: (bad)Copilot until v2.1, ClaudeCode since v3.0
 # Mastermind: sp
 #
@@ -18,6 +24,7 @@
 #   2.1: Populates all baseline GPOs with security, firewall, Defender, SMB, RDP, Windows Update, and startup reliability settings, forming the complete domain hardening configuration.
 #   3.0: Adds transcript logging, a tunables block for the FGPP values, -WhatIf support, a single up-front confirmation prompt, and consolidates GPO identity/target/link state into the $GPOs array as the single source of truth.
 #   3.1: Correctness and robustness pass. The User Policy FGPP now sets explicit lockout values (it previously inherited a threshold of 0, disabling lockout for every domain user). -WhatIf no longer errors on objects it did not create. GPO settings writes go through Set-ClkGPOValue, which catches failures so a partial run is reported as such instead of announcing success. Janitors is resolved domain-wide, DC IP resolution is guarded against an empty result, the root OU name is validated, and the transcript is closed on unhandled errors. Adds a #Requires preamble (elevation, PS 5.1, both modules), caches Get-GPInheritance per OU, and batches registry values that share a key and a type into single writes. Restores the "Starting dcconfig" / "dcconfig completed successfully" banners, both (plus the -WhatIf and failure banners) printing the running script's version, read at runtime from this Version History block so it can never drift out of sync with the one place a version is maintained.
+#   3.2: Redirects the default computer/user containers via redircmp/redirusr so objects created without an explicit OU (a domain-joined computer, a bare net user) land in the Workstations and Users OUs instead of the invisible-to-GPO CN=Computers/CN=Users containers. Adds a "Settings: GP Refresh" GPO, linked to the Servers and Computers OUs, setting the Group Policy refresh interval to 15 minutes.
 # ============================================================
 
 
@@ -107,6 +114,8 @@ Write-Host ""
 # Configuration
 # ============================================================
 # Fine-Grained Password Policy tunables - adjust here for org-specific requirements.
+# MinPasswordLength values are sp's deliberate call, not an oversight - leave as-is
+# unless he says otherwise.
 $DomainAdminPasswordMinLength         = 8
 $DomainAdminPasswordHistoryCount      = 16
 $DomainAdminMaxPasswordAgeDays        = 365
@@ -156,6 +165,30 @@ function New-OU {
     }
     else {
         Write-Host "OU already exists: $Name" -ForegroundColor Gray
+    }
+}
+
+# redircmp.exe/redirusr.exe are OS-shipped binaries (not PowerShell cmdlets) that set
+# the domain's default computer/user container - there is no AD cmdlet for this, so
+# idempotency is checked via Get-ADDomain's ComputersContainer/UsersContainer instead
+# of a Get-* existence check like the other New-Clk* helpers use.
+function Set-ClkDefaultContainer {
+    [CmdletBinding(SupportsShouldProcess)]
+    param (
+        [string]$ContainerType,
+        [string]$CurrentContainer,
+        [string]$TargetOU,
+        [string]$Command
+    )
+
+    if ($CurrentContainer -eq $TargetOU) {
+        Write-Host "Default $ContainerType container already set to: $TargetOU" -ForegroundColor Gray
+        return
+    }
+
+    if ($PSCmdlet.ShouldProcess($TargetOU, "Set default $ContainerType container ($Command)")) {
+        & $Command $TargetOU | Out-Null
+        Write-Host "Set default ${ContainerType} container: $TargetOU" -ForegroundColor Green
     }
 }
 
@@ -296,6 +329,7 @@ $WorkstationsOU = "OU=Workstations,$ComputersOU"
 Write-Host ""
 Write-Host "This will configure the following baseline under '$BaseOU':" -ForegroundColor Cyan
 Write-Host "  - OU structure (Admins, Users, Groups, Computers, Servers, Workstations, !SrvcAccts)"
+Write-Host "  - Default computer/user containers redirected to Workstations/Users (redircmp/redirusr)"
 Write-Host "  - 'Janitors' admin group, with the current user added as a member"
 Write-Host "  - Current user moved to the Admins OU"
 Write-Host "  - Fine-Grained Password Policies for admins and users"
@@ -330,6 +364,17 @@ New-OU "Contacts" $GroupsOU
 
 New-OU "Servers" $ComputersOU
 New-OU "Workstations" $ComputersOU
+
+Write-Host ""
+
+# ============================================================
+# Default Computer/User Containers (redircmp / redirusr)
+# ============================================================
+# Without this, a computer joining the domain (or a user created without an explicit
+# -Path) lands in the CN=Computers/CN=Users containers rather than the OU structure
+# above, invisible to every GPO linked above since GPOs don't link to containers.
+Set-ClkDefaultContainer -ContainerType "Computer" -CurrentContainer $Domain.ComputersContainer -TargetOU $WorkstationsOU -Command "redircmp.exe"
+Set-ClkDefaultContainer -ContainerType "User"     -CurrentContainer $Domain.UsersContainer     -TargetOU $UsersOU        -Command "redirusr.exe"
 
 Write-Host ""
 
@@ -473,6 +518,7 @@ $GPOs = @(
     [PSCustomObject]@{ Name = "Security: Disable AutoPlay";          TargetOU = @($ComputersOU);        Disabled = $false }
     [PSCustomObject]@{ Name = "Security: SMB Hardening";             TargetOU = @($ComputersOU);        Disabled = $false }
     [PSCustomObject]@{ Name = "Settings: Wait for network";          TargetOU = @($ComputersOU);        Disabled = $false }
+    [PSCustomObject]@{ Name = "Settings: GP Refresh";                TargetOU = @($ServersOU, $ComputersOU); Disabled = $false }
     # Intentionally at the Computers OU: RDP is enabled on workstations as well as
     # servers, and who may actually reach it is controlled by the firewall GPOs below.
     [PSCustomObject]@{ Name = "Settings: Enable RDP";                TargetOU = @($ComputersOU);        Disabled = $false }
@@ -928,6 +974,35 @@ Confirm-GPOPopulated $WaitForNetworkGPO
 
 
 ###
+# GPO: Settings: GP Refresh
+# ADMX Policy: System\Group Policy\Set Group Policy refresh interval for computers = Enabled
+# Group Policy Refresh Interval: 15 minutes, Random offset: 2 minutes
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$GPRefreshGPO = "Settings: GP Refresh"
+
+# ------------------------------------------------------------
+# Group Policy refresh interval (same key, same type - written in one call)
+# GroupPolicyRefreshTime = 15 (minutes)
+# GroupPolicyRefreshTimeOffset = 2 (random offset, minutes)
+# ------------------------------------------------------------
+Set-ClkGPOValue `
+    -Name $GPRefreshGPO `
+    -Key "HKLM\Software\Policies\Microsoft\Windows\Group Policy" `
+    -ValueName "GroupPolicyRefreshTime", "GroupPolicyRefreshTimeOffset" `
+    -Type DWord `
+    -Value 15, 2
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Confirm-GPOPopulated $GPRefreshGPO
+
+
+###
 # GPO: Settings: Enable RDP
 # ADMX Policies:
 # - Allow users to connect remotely by using Remote Desktop Services
@@ -1020,5 +1095,3 @@ Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 
 # Future feature plan:
 # - Add more GPO settings to fully implement the baseline hardening configuration.
-# redircmp "OU=Workstations,OU=Computers,OU=<RootOU>,DC=example,DC=com"
-# redirusr "OU=Users,OU=<RootOU>,DC=example,DC=com"
