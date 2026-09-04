@@ -96,8 +96,11 @@ function Get-ClkScriptVersion {
     try {
         # @() matters: with a single Version History entry the pipeline returns a bare
         # string, and [-1] on a string is its last character - so this would report
-        # "v0" for a 1.0 header rather than "v1.0".
-        $versions = @(Select-String -LiteralPath $Path -Pattern '^#\s+(\d+\.\d+(?:-[A-Za-z0-9]+)?):' -ErrorAction Stop |
+        # "v0" for a 1.0 header rather than "v1.0". The optional third group is what
+        # lets a patch release (1.0.1) be read; without it the pattern stopped at the
+        # minor and demanded a colon, so a X.Y.Z entry matched nothing and the banner
+        # silently reported the previous X.Y version instead.
+        $versions = @(Select-String -LiteralPath $Path -Pattern '^#\s+(\d+\.\d+(?:\.\d+)?(?:-[A-Za-z0-9]+)?):' -ErrorAction Stop |
             ForEach-Object { $_.Matches[0].Groups[1].Value })
         if ($versions) { return "v$($versions[-1])" }
     }
