@@ -25,6 +25,7 @@
 #   3.0: Adds transcript logging, a tunables block for the FGPP values, -WhatIf support, a single up-front confirmation prompt, and consolidates GPO identity/target/link state into the $GPOs array as the single source of truth.
 #   3.1: Correctness and robustness pass. The User Policy FGPP now sets explicit lockout values (it previously inherited a threshold of 0, disabling lockout for every domain user). -WhatIf no longer errors on objects it did not create. GPO settings writes go through Set-ClkGPOValue, which catches failures so a partial run is reported as such instead of announcing success. Janitors is resolved domain-wide, DC IP resolution is guarded against an empty result, the root OU name is validated, and the transcript is closed on unhandled errors. Adds a #Requires preamble (elevation, PS 5.1, both modules), caches Get-GPInheritance per OU, and batches registry values that share a key and a type into single writes. Restores the "Starting dcconfig" / "dcconfig completed successfully" banners, both (plus the -WhatIf and failure banners) printing the running script's version, read at runtime from this Version History block so it can never drift out of sync with the one place a version is maintained.
 #   3.2: Redirects the default computer/user containers via redircmp/redirusr so objects created without an explicit OU (a domain-joined computer, a bare net user) land in the Workstations and Users OUs instead of the invisible-to-GPO CN=Computers/CN=Users containers. Adds a "Settings: GP Refresh" GPO, linked to the Servers and Computers OUs, setting the Group Policy refresh interval to 15 minutes.
+#   3.3: Adds a "Deploy: ESMC" GPO, linked (disabled) to the Computers and Servers OUs, as an empty placeholder for future ESET ESMC deployment settings. New-ClkGPOLink now reconciles an existing link's enabled state instead of only checking that the link exists, so changing a $GPOs entry's Disabled flag takes effect on a re-run rather than being silently ignored on a domain the script has already configured. Populates and enables three GPOs that were previously created empty with their links disabled: "Firewall: Allow from DC" and "Firewall: Allow from Clickwork HQ" (192.168.10.5/32) now get inbound allow-any rules written into their Windows Defender Firewall with Advanced Security store via the new Set-ClkGPOFirewallRule helper - the legacy WindowsFirewall ADMX used by the other firewall GPOs cannot express an all-ports rule scoped to an address - and "Settings: NoSleep" gets the plugged-in sleep and hibernate timeouts set to never. "Settings: EDGE Policies" is populated and enabled too, as user-configuration values under HKCU\Software\Policies\Microsoft\Edge; these render as Extra Registry Settings until msedge.admx is imported into the Central Store, after which the same values start displaying as named policies with no rewrite. Adds NetSecurity to the #Requires module list.
 # ============================================================
 
 
@@ -37,7 +38,7 @@
 # so the Import-Module calls below are belt-and-braces for readability.
 #Requires -Version 5.1
 #Requires -RunAsAdministrator
-#Requires -Modules ActiveDirectory, GroupPolicy
+#Requires -Modules ActiveDirectory, GroupPolicy, NetSecurity
 
 [CmdletBinding(SupportsShouldProcess)]
 param()
@@ -208,18 +209,21 @@ function New-ClkGPO {
 }
 
 # Get-GPInheritance is a round-trip per call, and the link loop asks about the same
-# handful of OUs once per GPO. Cache the linked-GPO names per OU on first use; there
-# are ~22 links across 6 distinct OUs, so this turns 22 queries into 6.
+# handful of OUs once per GPO. Cache each OU's links on first use as a
+# name -> enabled map; there are ~23 links across 6 distinct OUs, so this turns 23
+# queries into 6. The enabled state is cached alongside the name because
+# New-ClkGPOLink reconciles it, not just the link's existence.
 $script:GPLinkCache = @{}
 
-function Get-ClkGPOLinkNames {
+function Get-ClkGPOLinkState {
     param ([string]$TargetOU)
 
     if (-not $script:GPLinkCache.ContainsKey($TargetOU)) {
-        $script:GPLinkCache[$TargetOU] = @(
-            (Get-GPInheritance -Target $TargetOU).GpoLinks |
-                Select-Object -ExpandProperty DisplayName
-        )
+        $state = @{}
+        foreach ($link in (Get-GPInheritance -Target $TargetOU).GpoLinks) {
+            $state[$link.DisplayName] = $link.Enabled
+        }
+        $script:GPLinkCache[$TargetOU] = $state
     }
 
     return $script:GPLinkCache[$TargetOU]
@@ -233,24 +237,45 @@ function New-ClkGPOLink {
         [bool]$Disabled = $false
     )
 
-    $existing = (Get-ClkGPOLinkNames $TargetOU) -contains $GPOName
+    # Returned by reference, so the writes below keep the cache current.
+    $Links       = Get-ClkGPOLinkState $TargetOU
+    $WantEnabled = -not $Disabled
+    $LinkEnabled = if ($WantEnabled) { "Yes" } else { "No" }
 
-    if (-not $existing) {
-        if ($Disabled) {
-            if ($PSCmdlet.ShouldProcess("$GPOName -> $TargetOU", "Link GPO (disabled)")) {
-                New-GPLink -Name $GPOName -Target $TargetOU -LinkEnabled No | Out-Null
-                $script:GPLinkCache[$TargetOU] += $GPOName
+    if (-not $Links.ContainsKey($GPOName)) {
+        if ($PSCmdlet.ShouldProcess("$GPOName -> $TargetOU", "Link GPO (enabled: $LinkEnabled)")) {
+            New-GPLink -Name $GPOName -Target $TargetOU -LinkEnabled $LinkEnabled | Out-Null
+            $Links[$GPOName] = $WantEnabled
+
+            if ($WantEnabled) {
+                Write-Host "Linked: $GPOName -> $TargetOU" -ForegroundColor Green
+            }
+            else {
                 Write-Host "Linked (disabled): $GPOName -> $TargetOU" -ForegroundColor Yellow
             }
         }
-        elseif ($PSCmdlet.ShouldProcess("$GPOName -> $TargetOU", "Link GPO")) {
-            New-GPLink -Name $GPOName -Target $TargetOU | Out-Null
-            $script:GPLinkCache[$TargetOU] += $GPOName
-            Write-Host "Linked: $GPOName -> $TargetOU" -ForegroundColor Green
-        }
+        return
     }
-    else {
+
+    # The link exists, so creation is a no-op - but its enabled state can still be
+    # wrong. Flipping Disabled in $GPOs was otherwise silently ignored on any domain
+    # the script had already been run against: the link was found, reported as
+    # "already exists", and left in whatever state the earlier run gave it.
+    if ($Links[$GPOName] -eq $WantEnabled) {
         Write-Host "Link already exists: $GPOName -> $TargetOU" -ForegroundColor Gray
+        return
+    }
+
+    if ($PSCmdlet.ShouldProcess("$GPOName -> $TargetOU", "Set link enabled: $LinkEnabled")) {
+        Set-GPLink -Name $GPOName -Target $TargetOU -LinkEnabled $LinkEnabled | Out-Null
+        $Links[$GPOName] = $WantEnabled
+
+        if ($WantEnabled) {
+            Write-Host "Link enabled: $GPOName -> $TargetOU" -ForegroundColor Green
+        }
+        else {
+            Write-Host "Link disabled: $GPOName -> $TargetOU" -ForegroundColor Yellow
+        }
     }
 }
 
@@ -276,6 +301,47 @@ function Set-ClkGPOValue {
     catch {
         $script:GPOFailures[$Name] = $ValueName.Count + [int]$script:GPOFailures[$Name]
         Write-Host "  FAILED: [$Name] $Key\$($ValueName -join ', ') - $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+# A "permit every port from this address" rule has no expression in the legacy
+# WindowsFirewall ADMX the blocks above use - that schema only scopes per-service and
+# per-port exceptions - so these rules are written into the GPO's Windows Defender
+# Firewall with Advanced Security store instead, where GPMC shows them as ordinary
+# inbound rules rather than as registry settings. Not being a registry write, it
+# cannot go through Set-ClkGPOValue, so it mirrors that helper's contract instead:
+# failures are tallied per GPO in $script:GPOFailures and Confirm-GPOPopulated still
+# reports the block accurately.
+function Set-ClkGPOFirewallRule {
+    param (
+        [string]$Name,
+        [string]$PolicyStore,
+        [string]$RuleName,
+        [string]$DisplayName,
+        [string[]]$RemoteAddress
+    )
+
+    try {
+        $Existing = Get-NetFirewallRule -PolicyStore $PolicyStore -Name $RuleName -ErrorAction SilentlyContinue
+
+        # DC addresses can differ from the run that first created the rule. Correct
+        # the scope rather than skipping it, so a re-run converges the same way an
+        # overwriting Set-ClkGPOValue call does.
+        if ($Existing) {
+            Set-NetFirewallRule -PolicyStore $PolicyStore -Name $RuleName `
+                -RemoteAddress $RemoteAddress -ErrorAction Stop
+            Write-Host "  Rule scope updated: $DisplayName ($($RemoteAddress -join ', '))" -ForegroundColor Gray
+        }
+        else {
+            New-NetFirewallRule -PolicyStore $PolicyStore -Name $RuleName `
+                -DisplayName $DisplayName -Direction Inbound -Action Allow `
+                -Profile Any -RemoteAddress $RemoteAddress -ErrorAction Stop | Out-Null
+            Write-Host "  Rule created: $DisplayName ($($RemoteAddress -join ', '))" -ForegroundColor Gray
+        }
+    }
+    catch {
+        $script:GPOFailures[$Name] = 1 + [int]$script:GPOFailures[$Name]
+        Write-Host "  FAILED: [$Name] $DisplayName - $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
@@ -510,8 +576,8 @@ $GPOs = @(
     [PSCustomObject]@{ Name = "Security: Enable Firewall";           TargetOU = @($ComputersOU);        Disabled = $false }
     [PSCustomObject]@{ Name = "Firewall: Default Server Rules";      TargetOU = @($ServersOU);          Disabled = $false }
     [PSCustomObject]@{ Name = "Firewall: Default Workstation Rules"; TargetOU = @($WorkstationsOU);     Disabled = $false }
-    [PSCustomObject]@{ Name = "Firewall: Allow from DC";             TargetOU = @($ComputersOU);        Disabled = $true  }
-    [PSCustomObject]@{ Name = "Firewall: Allow from Clickwork HQ";   TargetOU = @($ComputersOU);        Disabled = $true  }
+    [PSCustomObject]@{ Name = "Firewall: Allow from DC";             TargetOU = @($ComputersOU);        Disabled = $false }
+    [PSCustomObject]@{ Name = "Firewall: Allow from Clickwork HQ";   TargetOU = @($ComputersOU);        Disabled = $false }
     [PSCustomObject]@{ Name = "Firewall: Allow ESMC";                TargetOU = @($ComputersOU);        Disabled = $true  }
     [PSCustomObject]@{ Name = "Security: Enable Defender";           TargetOU = @($ComputersOU);        Disabled = $false }
     [PSCustomObject]@{ Name = "Security: Ctrl+Alt+Del";              TargetOU = @($ComputersOU);        Disabled = $true  }
@@ -522,7 +588,7 @@ $GPOs = @(
     # Intentionally at the Computers OU: RDP is enabled on workstations as well as
     # servers, and who may actually reach it is controlled by the firewall GPOs below.
     [PSCustomObject]@{ Name = "Settings: Enable RDP";                TargetOU = @($ComputersOU);        Disabled = $false }
-    [PSCustomObject]@{ Name = "Settings: NoSleep";                   TargetOU = @($WorkstationsOU);     Disabled = $true  }
+    [PSCustomObject]@{ Name = "Settings: NoSleep";                   TargetOU = @($WorkstationsOU);     Disabled = $false }
     [PSCustomObject]@{ Name = "Settings: Workstation Updates";       TargetOU = @($WorkstationsOU);     Disabled = $false }
     [PSCustomObject]@{ Name = "Printers: Remove garbage";            TargetOU = @($WorkstationsOU);     Disabled = $true  }
     [PSCustomObject]@{ Name = "Customization: Lock Screen";          TargetOU = @($WorkstationsOU);     Disabled = $true  }
@@ -530,7 +596,8 @@ $GPOs = @(
     [PSCustomObject]@{ Name = "Customization: Regional";             TargetOU = @($UsersOU);            Disabled = $true  }
     [PSCustomObject]@{ Name = "Customization: Explorer";             TargetOU = @($UsersOU);            Disabled = $true  }
     [PSCustomObject]@{ Name = "Customization: NoCloud content";      TargetOU = @($UsersOU);            Disabled = $true  }
-    [PSCustomObject]@{ Name = "Settings: EDGE Policies";             TargetOU = @($UsersOU, $AdminsOU); Disabled = $true  }
+    [PSCustomObject]@{ Name = "Settings: EDGE Policies";             TargetOU = @($UsersOU, $AdminsOU); Disabled = $false }
+    [PSCustomObject]@{ Name = "Deploy: ESMC";                        TargetOU = @($ComputersOU, $ServersOU); Disabled = $true  }
 )
 
 foreach ($gpo in $GPOs) {
@@ -789,6 +856,78 @@ Set-ClkGPOValue `
 # Confirm settings population
 # ------------------------------------------------------------
 Confirm-GPOPopulated $WorkstationFirewallGPO
+
+
+###
+# GPO: Firewall: Allow from DC
+# Path: Windows Settings > Security Settings > Windows Defender Firewall with
+#       Advanced Security > Inbound Rules
+#
+# Unlike the two blocks above, this is a WFAS rule rather than a legacy ADMX
+# registry setting - "allow every port and protocol from this address" has no
+# equivalent in that ADMX schema, which only exposes per-service and per-port
+# exceptions. The two models coexist: a packet is permitted if either allows it.
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$AllowFromDCGPO = "Firewall: Allow from DC"
+
+# ------------------------------------------------------------
+# Allow all inbound traffic from the domain controllers
+#
+# Scoped to the same $DCIPs snapshot the server and workstation rules above use.
+# This is the broad counterpart to those narrow per-service exceptions: it makes a
+# DC reachable on any port, so anything managed from a DC keeps working without a
+# new exception per service. It also means DC compromise grants unrestricted
+# inbound reach into every machine in the tree - the accepted trade for a tree
+# whose management all originates from the DC.
+# ------------------------------------------------------------
+Set-ClkGPOFirewallRule `
+    -Name $AllowFromDCGPO `
+    -PolicyStore "$($Domain.DNSRoot)\$AllowFromDCGPO" `
+    -RuleName "CLK-AllowInboundFromDC" `
+    -DisplayName "Allow all inbound from domain controllers" `
+    -RemoteAddress $DCIPs
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Confirm-GPOPopulated $AllowFromDCGPO
+
+
+###
+# GPO: Firewall: Allow from Clickwork HQ
+# Path: Windows Settings > Security Settings > Windows Defender Firewall with
+#       Advanced Security > Inbound Rules
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$AllowFromHQGPO = "Firewall: Allow from Clickwork HQ"
+
+# ------------------------------------------------------------
+# Allow all inbound traffic from the Clickwork HQ management address
+#
+# A single host, not the surrounding /24: the intent is to reach machines from
+# that one management box, so widening it to the subnet would grant every device
+# on that network the same unrestricted access.
+# ------------------------------------------------------------
+$HQAddress = "192.168.10.5/32"
+
+Set-ClkGPOFirewallRule `
+    -Name $AllowFromHQGPO `
+    -PolicyStore "$($Domain.DNSRoot)\$AllowFromHQGPO" `
+    -RuleName "CLK-AllowInboundFromHQ" `
+    -DisplayName "Allow all inbound from Clickwork HQ" `
+    -RemoteAddress $HQAddress
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Confirm-GPOPopulated $AllowFromHQGPO
 
 
 ###
@@ -1069,6 +1208,135 @@ Set-ClkGPOValue `
 Confirm-GPOPopulated $WorkstationUpdatesGPO
 
 
+###
+# GPO: Settings: NoSleep
+# ADMX Policy: System > Power Management > Sleep Settings
+#   "Specify the system sleep timeout (plugged in)"     = Enabled, 0
+#   "Specify the system hibernate timeout (plugged in)" = Enabled, 0
+#
+# Each power setting is keyed by its own GUID under PowerSettings, so these are two
+# keys and therefore two calls. ACSettingIndex is the plugged-in value; the DC
+# counterpart (on battery) is deliberately left alone, so a laptop still sleeps on
+# battery. 0 means never.
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$NoSleepGPO = "Settings: NoSleep"
+
+$PowerSettingsKey = "HKLM\Software\Policies\Microsoft\Power\PowerSettings"
+
+# ------------------------------------------------------------
+# Never sleep while plugged in (STANDBYIDLE)
+# ------------------------------------------------------------
+Set-ClkGPOValue `
+    -Name $NoSleepGPO `
+    -Key "$PowerSettingsKey\29F6C1DB-86DA-48C5-9FDB-F2B67B1F44DA" `
+    -ValueName "ACSettingIndex" `
+    -Type DWord `
+    -Value 0
+
+# ------------------------------------------------------------
+# Never hibernate while plugged in (HIBERNATEIDLE)
+# Without this, the sleep timeout above only defers the machine to hibernation.
+# ------------------------------------------------------------
+Set-ClkGPOValue `
+    -Name $NoSleepGPO `
+    -Key "$PowerSettingsKey\9D7815A6-7EE4-497E-8888-515A05F02364" `
+    -ValueName "ACSettingIndex" `
+    -Type DWord `
+    -Value 0
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Confirm-GPOPopulated $NoSleepGPO
+
+
+###
+# GPO: Settings: EDGE Policies
+# ADMX Policy: Administrative Templates > Microsoft Edge
+#
+# User configuration (HKCU), because this GPO is linked to the Users and Admins OUs
+# rather than to a computer OU. Edge reads policy from both hives, HKLM winning.
+#
+# msedge.admx/.adml ships separately from Windows and is usually not installed when
+# this script first runs, in which case GPMC shows these as Extra Registry Settings
+# until it is. That is a display concern only: registry.pol records no reference to
+# any ADMX, so once the definitions are in the Central Store the same bytes start
+# rendering as named policies with no rewrite and no re-run. Two consequences worth
+# knowing: creating a Central Store makes GPMC ignore C:\Windows\PolicyDefinitions
+# entirely, so the full Windows ADMX set has to be copied there alongside msedge.admx
+# or every other policy in the tree goes unknown; and because the names below were
+# written without an ADMX on hand to check them against, a value whose name or type
+# does not match its policy exactly will stay unknown forever rather than fail loudly.
+# After importing the ADMX, open this GPO once - anything still listed under Extra
+# Registry Settings is a mismatch to correct here.
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$EdgeGPO = "Settings: EDGE Policies"
+
+$EdgeKey = "HKCU\Software\Policies\Microsoft\Edge"
+
+# ------------------------------------------------------------
+# Edge policies stored as DWords (same key, same type - one call)
+# Policy: Force synchronization of browser data and do not show the sync consent
+#         prompt = Enabled (ForceSync = 1)
+# Policy: Hide the First-run experience and splash screen = Enabled
+#         (HideFirstRunExperience = 1)
+# Policy: Show Hubs Sidebar = Disabled (HubsSidebarEnabled = 0)
+# Policy: Show Microsoft Rewards experiences = Disabled (ShowMicrosoftRewards = 0)
+# Policy: Automatically import another browser's data and settings at first run
+#         = Disables automatic import, and the import section of the first-run
+#         experience is skipped (AutoImportAtFirstRun = 4)
+# Policy: Allow Microsoft News content on the new tab page = Disabled
+#         (NewTabPageContentEnabled = 0)
+# Policy: Hide the default top sites from the new tab page = Enabled
+#         (NewTabPageHideDefaultTopSites = 1)
+# Policy: Enable the default search provider = Enabled
+#         (DefaultSearchProviderEnabled = 1). Not in gpos.xlsx, but the whole
+#         DefaultSearchProvider* family below is ignored without it.
+# ------------------------------------------------------------
+Set-ClkGPOValue `
+    -Name $EdgeGPO `
+    -Key $EdgeKey `
+    -ValueName "ForceSync", "HideFirstRunExperience", "HubsSidebarEnabled", "ShowMicrosoftRewards", "AutoImportAtFirstRun", "NewTabPageContentEnabled", "NewTabPageHideDefaultTopSites", "DefaultSearchProviderEnabled" `
+    -Type DWord `
+    -Value 1, 1, 0, 0, 4, 0, 1, 1
+
+# ------------------------------------------------------------
+# Edge policies stored as strings (same key, same type - one call)
+# Policy: Manage Search Engines = Enabled, carrying its search engine list as JSON
+#         (ManagedSearchEngines)
+# Policy: New tab page search box experience = Address bar
+#         (NewTabPageSearchBox = "redirect"; "bing" would be the search box)
+# Policy: Default search provider name / keyword / search URL / URL for suggestions
+#
+# ManagedSearchEngines takes precedence over the DefaultSearchProvider* values when
+# both are set, so the effective default is the JSON list's Google RO entry. Both are
+# written because gpos.xlsx specifies both.
+# ------------------------------------------------------------
+$ManagedSearchEngines = '[{"allow_search_engine_discovery":true},{"is_default":true,"search_url":"https://www.google.ro/search?q={searchTerms}","name":"Google RO","keyword":"google.ro"}]'
+$SearchURL            = '{google:baseURL}search?q=%s&{google:RLZ}{google:originalQueryForSuggestion}{google:assistedQueryStats}{google:searchFieldtrialParameter}{google:iOSSearchLanguage}{google:searchClient}{google:sourceId}{google:contextualSearchVersion}ie={inputEncoding}'
+$SuggestURL           = '{google:baseURL}complete/search?output=chrome&q={searchTerms}'
+
+Set-ClkGPOValue `
+    -Name $EdgeGPO `
+    -Key $EdgeKey `
+    -ValueName "ManagedSearchEngines", "NewTabPageSearchBox", "DefaultSearchProviderName", "DefaultSearchProviderKeyword", "DefaultSearchProviderSearchURL", "DefaultSearchProviderSuggestURL" `
+    -Type String `
+    -Value $ManagedSearchEngines, "redirect", "Google", "google.ro", $SearchURL, $SuggestURL
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Confirm-GPOPopulated $EdgeGPO
+
+
 ##########################################
 ###          Script completed          ###
 ##########################################
@@ -1094,4 +1362,44 @@ Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 
 
 # Future feature plan:
-# - Add more GPO settings to fully implement the baseline hardening configuration.
+#
+# Nine GPOs are still created empty with their links disabled, to be filled in by
+# hand per deployment. Each is blocked on something specific, not merely unwritten -
+# the constraint is that every setting must render in GPMC/gpedit as a named policy,
+# never as "Extra Registry Settings", and that nothing may be hand-edited in SYSVOL.
+# A registry.pol value renders as a named policy if and only if a loaded ADMX defines
+# that exact key and value name, so that test decides where each of these can go.
+#
+# - Settings: EDGE Policies is populated but still owes a verification pass: import
+#   msedge.admx/.adml into the Central Store, then open the GPO once. Anything left
+#   under Extra Registry Settings is a name or type that does not match its policy
+#   and needs correcting in the block above.
+#
+# - Security: Ctrl+Alt+Del and Customization: Regional / Explorer. No ADMX exists for
+#   any of these values. DisableCAD is a Security Option (GptTmpl.inf); the Explorer
+#   and Control Panel\International values are preferences, whose only GUI-native home
+#   is Preferences > Registry (Registry.xml). Both are SYSVOL files and the
+#   GroupPolicy module has no API for either - Set-GPRegistryValue writes registry.pol
+#   and nothing else. The one route that satisfies both constraints is to configure
+#   each once by hand on a reference DC, Backup-GPO it into this repo, and Import-GPO
+#   it here: the cmdlets do the SYSVOL writing, and the result is GUI-native. Note
+#   Import-GPO replaces a GPO's entire contents, so a backup must be complete rather
+#   than incremental.
+#
+# - Customization: NoCloud content is a mix: "Turn off Microsoft consumer experiences"
+#   is ADMX-backed, while the ContentDeliveryManager values are preferences. Check
+#   each value against the ADMX before deciding which half goes where.
+#
+# - Printers: Remove garbage, Customization: Lock Screen / Wallpaper, Deploy: ESMC and
+#   Firewall: Allow ESMC are unspecified beyond their names in gpos.xlsx.
+#
+# - Security: SMB Hardening writes SMB1 and the Browser service's Start value under
+#   HKLM\SYSTEM\CurrentControlSet\Services, which no ADMX covers and which is outside
+#   any managed policy branch: they show as Extra Registry Settings and they tattoo.
+#   The comments above them name GUI locations the values do not actually reach. The
+#   GUI-native equivalents are System Services (Import-GPO again) for the Browser
+#   service, and for SMBv1 removing the feature outright via DISM rather than a GPO.
+#
+# Validation still owed on a lab DC, both from the v3.3 firewall work: that
+# -PolicyStore tolerates the colon in GPO names such as "Firewall: Allow from DC",
+# and that Set-ClkGPOFirewallRule's update path behaves on a second run.
