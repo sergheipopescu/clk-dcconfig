@@ -27,6 +27,7 @@
 #
 # Version History:
 #   1.0: Initial version. Seeds the Central Store from the local PolicyDefinitions folder when it does not yet exist, then overlays the Windows 11, Office, Edge and Chrome templates, each downloaded at run time. Supports -SourceDir for DCs with no outbound internet access, and -WhatIf, which resolves and prints every download URL without fetching anything. Adds -Embedded, used by dcconfig.ps1 to call this script as its final step without a second prompt, a second transcript or a competing completion banner, taking back the failure count to fold into its own.
+#   1.1: The Cleanup step's Remove-Item -Recurse is now wrapped in its own try/catch. Found running v1.0 on the first live-DC test: it threw an ItemNotFoundException -ErrorAction SilentlyContinue did not suppress (most likely a file removed out from under the recursive delete by real-time AV scanning the just-downloaded installers), which reached the script-level trap and reported the whole Central Store import as failed even though every source - Base Windows, Windows 11, Office, Edge, Chrome - had already copied in successfully beforehand. A failed cleanup of a scratch temp folder is now a yellow warning, not a run failure.
 # ============================================================
 
 
@@ -651,7 +652,24 @@ if (Test-Path -LiteralPath $WorkDir) {
         Write-Host "Copy that folder to an offline DC and re-run there with -SourceDir to import the same versions." -ForegroundColor Yellow
     }
     else {
-        Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
+        # -ErrorAction SilentlyContinue does not reliably suppress every failure
+        # -Recurse can hit: observed live, an ItemNotFoundException mid-recursion (most
+        # likely a file that vanished between enumeration and delete - real-time AV
+        # scanning the just-downloaded installers is the obvious suspect on a DC with
+        # outbound internet). That is a terminating error PowerShell's -Recurse path
+        # does not always honor SilentlyContinue for, so without a catch here it
+        # reaches the script-level trap and reports the whole import as failed even
+        # though every source above already copied into the Central Store
+        # successfully. A leftover scratch folder under $env:TEMP is harmless -
+        # nothing here is worth failing the run over.
+        try {
+            Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Host ""
+            Write-Host "Could not fully remove the temporary working folder $WorkDir - $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "Harmless - delete it by hand later if you like. Every source above already imported successfully." -ForegroundColor Yellow
+        }
     }
 }
 

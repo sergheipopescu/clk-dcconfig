@@ -28,7 +28,7 @@
 #   3.2: Redirects the default computer/user containers via redircmp/redirusr so objects created without an explicit OU (a domain-joined computer, a bare net user) land in the Workstations and Users OUs instead of the invisible-to-GPO CN=Computers/CN=Users containers. Adds a "Settings: GP Refresh" GPO, linked to the Servers and Computers OUs, setting the Group Policy refresh interval to 15 minutes.
 #   3.3: Adds a "Deploy: ESMC" GPO, linked (disabled) to the Computers and Servers OUs, as an empty placeholder for future ESET ESMC deployment settings. New-ClkGPOLink now reconciles an existing link's enabled state instead of only checking that the link exists, so changing a $GPOs entry's Disabled flag takes effect on a re-run rather than being silently ignored on a domain the script has already configured. Populates and enables three GPOs that were previously created empty with their links disabled: "Firewall: Allow from DC" and "Firewall: Allow from Clickwork HQ" (192.168.10.5/32) now get inbound allow-any rules written into their Windows Defender Firewall with Advanced Security store via the new Set-ClkGPOFirewallRule helper - the legacy WindowsFirewall ADMX used by the other firewall GPOs cannot express an all-ports rule scoped to an address - and "Settings: NoSleep" gets the plugged-in sleep and hibernate timeouts set to never. "Settings: EDGE Policies" is populated and enabled too, as user-configuration values under HKCU\Software\Policies\Microsoft\Edge; these render as Extra Registry Settings until msedge.admx is imported into the Central Store, after which the same values start displaying as named policies with no rewrite. Adds NetSecurity to the #Requires module list.
 #   3.4: Adds admxupdate.ps1, a second script that imports the current Windows 11, Office, Edge and Chrome ADMX/ADML templates into the domain's Group Policy Central Store, so the policies this script writes render as named policies in GPMC rather than as Extra Registry Settings. It stands alone - it is the one to re-run on other DCs, or when a new Windows release ships, since the Central Store is a single replicated path rather than per-DC state - and dcconfig.ps1 also calls it as its final step with -Embedded, which suppresses its prompt, transcript and banners and hands back a failure count for the completion banner to report separately from the GPO tally. Placed last because nothing above depends on it: registry.pol records no reference to any ADMX, so the Central Store only decides how already-correct settings display. New -SkipCentralStore switch leaves it out, and a missing admxupdate.ps1 is a warning rather than a failure, so dcconfig.ps1 still works when it is the only file copied to a DC.
-#   3.4.1: Set-ClkDefaultContainer now checks redircmp/redirusr's exit code instead of discarding it and printing the green success line unconditionally, so a default container redirection that did not happen is reported rather than silent. Its failures, and any later non-GPO baseline failure, are tallied in $script:ADFailures and reported by the completion banner, which previously could announce a fully successful run while that step had failed. Get-ClkScriptVersion's pattern now accepts a three-part version, without which this very entry would have matched nothing and the banner would have kept reporting v3.4.
+#   3.5: Fixes a bug, present since v3.1, that silently broke every DWord GPO setting in the script - the firewall enable/exceptions, Defender, AutoPlay, SMB hardening, GP refresh, RDP, Windows Update, NoSleep, wait-for-network, and 8 of the 14 EDGE Policies values. Set-ClkGPOValue's own -ValueName/-Value parameters are always arrays, so every call - even one carrying a single value - forced Set-GPRegistryValue into its array/"list" parameter set, which only supports -Type String or ExpandString; every other type throws, whether given one value or several. Only the String-typed writes (RemoteAddresses scoping, Edge's search-provider strings) were ever actually landing. Found running v3.4.1 - never released, renamed to 3.5 once this fix landed - on the first live-DC test. Set-ClkGPOValue now writes each name/value pair with its own Set-GPRegistryValue call and genuinely scalar arguments, so the reliable single-value parameter set is always used regardless of type or how many values a call site passes. Also: Set-ClkDefaultContainer now checks redircmp/redirusr's exit code instead of discarding it and printing the green success line unconditionally, so a default container redirection that did not happen is reported rather than silent. Its failures, and any later non-GPO baseline failure, are tallied in $script:ADFailures and reported by the completion banner, which previously could announce a fully successful run while that step had failed. Get-ClkScriptVersion's pattern now also accepts a three-part version, so a future patch release still gets picked up correctly rather than the banner silently reporting the prior X.Y version.
 # ============================================================
 
 
@@ -333,9 +333,21 @@ function New-ClkGPOLink {
 # as a failure instead of printing a green "Populated" line regardless of outcome.
 $script:GPOFailures = @{}
 
-# -ValueName and -Value accept arrays, and each call is one open/commit of the GPO's
-# registry.pol. Values sharing a key AND a type can therefore be written in a single
-# call. -Type is singular, so a DWord and a String under the same key still need two.
+# -ValueName and -Value accept arrays so one call can list several values under a
+# shared key, but Set-GPRegistryValue's own array/"list" parameter set only supports
+# -Type String or ExpandString - passing it DWord (or any other kind) throws "the
+# DWord type is not supported for lists" with two or more names, and with exactly one
+# name PowerShell still binds into that same list parameter set (this function's own
+# parameters are typed as arrays, regardless of what a call site passes), surfacing
+# instead as "Unable to cast object of type 'System.Object[]' to type
+# 'System.IConvertible'". Found on the first live-DC run: every DWord write in the
+# script failed this way, batched or not, while the String-typed RemoteAddresses and
+# Edge writes succeeded. So -ValueName/-Value stay arrays for callers' convenience,
+# but each name/value pair is written with its own call, using genuinely scalar
+# arguments, so Set-GPRegistryValue always binds its reliable single-value parameter
+# set no matter the type. This costs one registry.pol open/commit per value instead
+# of per call - correctness over the batching CLAUDE.md previously documented, which
+# was silently wrong for every type except String/ExpandString.
 function Set-ClkGPOValue {
     param (
         [string]$Name,
@@ -345,12 +357,14 @@ function Set-ClkGPOValue {
         [object[]]$Value
     )
 
-    try {
-        Set-GPRegistryValue -Name $Name -Key $Key -ValueName $ValueName -Type $Type -Value $Value -ErrorAction Stop | Out-Null
-    }
-    catch {
-        $script:GPOFailures[$Name] = $ValueName.Count + [int]$script:GPOFailures[$Name]
-        Write-Host "  FAILED: [$Name] $Key\$($ValueName -join ', ') - $($_.Exception.Message)" -ForegroundColor Red
+    for ($i = 0; $i -lt $ValueName.Count; $i++) {
+        try {
+            Set-GPRegistryValue -Name $Name -Key $Key -ValueName $ValueName[$i] -Type $Type -Value $Value[$i] -ErrorAction Stop | Out-Null
+        }
+        catch {
+            $script:GPOFailures[$Name] = 1 + [int]$script:GPOFailures[$Name]
+            Write-Host "  FAILED: [$Name] $Key\$($ValueName[$i]) - $($_.Exception.Message)" -ForegroundColor Red
+        }
     }
 }
 
