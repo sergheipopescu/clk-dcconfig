@@ -29,6 +29,7 @@
 #   3.3: Adds a "Deploy: ESMC" GPO, linked (disabled) to the Computers and Servers OUs, as an empty placeholder for future ESET ESMC deployment settings. New-ClkGPOLink now reconciles an existing link's enabled state instead of only checking that the link exists, so changing a $GPOs entry's Disabled flag takes effect on a re-run rather than being silently ignored on a domain the script has already configured. Populates and enables three GPOs that were previously created empty with their links disabled: "Firewall: Allow from DC" and "Firewall: Allow from Clickwork HQ" (192.168.10.5/32) now get inbound allow-any rules written into their Windows Defender Firewall with Advanced Security store via the new Set-ClkGPOFirewallRule helper - the legacy WindowsFirewall ADMX used by the other firewall GPOs cannot express an all-ports rule scoped to an address - and "Settings: NoSleep" gets the plugged-in sleep and hibernate timeouts set to never. "Settings: EDGE Policies" is populated and enabled too, as user-configuration values under HKCU\Software\Policies\Microsoft\Edge; these render as Extra Registry Settings until msedge.admx is imported into the Central Store, after which the same values start displaying as named policies with no rewrite. Adds NetSecurity to the #Requires module list.
 #   3.4: Adds admxupdate.ps1, a second script that imports the current Windows 11, Office, Edge and Chrome ADMX/ADML templates into the domain's Group Policy Central Store, so the policies this script writes render as named policies in GPMC rather than as Extra Registry Settings. It stands alone - it is the one to re-run on other DCs, or when a new Windows release ships, since the Central Store is a single replicated path rather than per-DC state - and dcconfig.ps1 also calls it as its final step with -Embedded, which suppresses its prompt, transcript and banners and hands back a failure count for the completion banner to report separately from the GPO tally. Placed last because nothing above depends on it: registry.pol records no reference to any ADMX, so the Central Store only decides how already-correct settings display. New -SkipCentralStore switch leaves it out, and a missing admxupdate.ps1 is a warning rather than a failure, so dcconfig.ps1 still works when it is the only file copied to a DC.
 #   3.5: Fixes a bug, present since v3.1, that silently broke every DWord GPO setting in the script - the firewall enable/exceptions, Defender, AutoPlay, SMB hardening, GP refresh, RDP, Windows Update, NoSleep, wait-for-network, and 8 of the 14 EDGE Policies values. Set-ClkGPOValue's own -ValueName/-Value parameters are always arrays, so every call - even one carrying a single value - forced Set-GPRegistryValue into its array/"list" parameter set, which only supports -Type String or ExpandString; every other type throws, whether given one value or several. Only the String-typed writes (RemoteAddresses scoping, Edge's search-provider strings) were ever actually landing. Found running v3.4.1 - never released, renamed to 3.5 once this fix landed - on the first live-DC test. Set-ClkGPOValue now writes each name/value pair with its own Set-GPRegistryValue call and genuinely scalar arguments, so the reliable single-value parameter set is always used regardless of type or how many values a call site passes. Also: Set-ClkDefaultContainer now checks redircmp/redirusr's exit code instead of discarding it and printing the green success line unconditionally, so a default container redirection that did not happen is reported rather than silent. Its failures, and any later non-GPO baseline failure, are tallied in $script:ADFailures and reported by the completion banner, which previously could announce a fully successful run while that step had failed. Get-ClkScriptVersion's pattern now also accepts a three-part version, so a future patch release still gets picked up correctly rather than the banner silently reporting the prior X.Y version.
+#   3.6: Renames "Settings: EDGE Policies" to "Settings: EDGE User Policies" (still HKCU, still linked to the Users and Admins OUs) and adds a new "Settings: EDGE Computer Policies" GPO, linked to the Computers OU, writing ForceSync, HideFirstRunExperience, HubsSidebarEnabled, ShowMicrosoftRewards, NewTabPageContentEnabled and NewTabPageHideDefaultTopSites under HKLM as well. Prompted by comparing against a real Edge policy GPO backed up from another server: it set that same subset of values at the Computer level in addition to User, which our GPO never did. HKLM wins over HKCU for Edge policy, so the Computer-side copy is the one that can't be overridden per-user and applies regardless of which OU a user object sits in.
 # ============================================================
 
 
@@ -665,7 +666,8 @@ $GPOs = @(
     [PSCustomObject]@{ Name = "Customization: Regional";             TargetOU = @($UsersOU);            Disabled = $true  }
     [PSCustomObject]@{ Name = "Customization: Explorer";             TargetOU = @($UsersOU);            Disabled = $true  }
     [PSCustomObject]@{ Name = "Customization: NoCloud content";      TargetOU = @($UsersOU);            Disabled = $true  }
-    [PSCustomObject]@{ Name = "Settings: EDGE Policies";             TargetOU = @($UsersOU, $AdminsOU); Disabled = $false }
+    [PSCustomObject]@{ Name = "Settings: EDGE User Policies";        TargetOU = @($UsersOU, $AdminsOU); Disabled = $false }
+    [PSCustomObject]@{ Name = "Settings: EDGE Computer Policies";    TargetOU = @($ComputersOU);        Disabled = $false }
     [PSCustomObject]@{ Name = "Deploy: ESMC";                        TargetOU = @($ComputersOU, $ServersOU); Disabled = $true  }
 )
 
@@ -1324,11 +1326,12 @@ Confirm-GPOPopulated $NoSleepGPO
 
 
 ###
-# GPO: Settings: EDGE Policies
+# GPO: Settings: EDGE User Policies
 # ADMX Policy: Administrative Templates > Microsoft Edge
 #
 # User configuration (HKCU), because this GPO is linked to the Users and Admins OUs
-# rather than to a computer OU. Edge reads policy from both hives, HKLM winning.
+# rather than to a computer OU. Edge reads policy from both hives, HKLM winning - see
+# "Settings: EDGE Computer Policies" below for the subset also enforced at HKLM.
 #
 # msedge.admx/.adml ships separately from Windows and is usually not installed when
 # this script first runs, in which case GPMC shows these as Extra Registry Settings
@@ -1347,7 +1350,7 @@ Confirm-GPOPopulated $NoSleepGPO
 # ------------------------------------------------------------
 # Target GPO
 # ------------------------------------------------------------
-$EdgeGPO = "Settings: EDGE Policies"
+$EdgeGPO = "Settings: EDGE User Policies"
 
 $EdgeKey = "HKCU\Software\Policies\Microsoft\Edge"
 
@@ -1404,6 +1407,51 @@ Set-ClkGPOValue `
 # Confirm settings population
 # ------------------------------------------------------------
 Confirm-GPOPopulated $EdgeGPO
+
+
+###
+# GPO: Settings: EDGE Computer Policies
+# ADMX Policy: Administrative Templates > Microsoft Edge
+#
+# Computer configuration (HKLM), linked to the Computers OU. This duplicates a subset
+# of "Settings: EDGE User Policies" (same names, same values) at the machine level:
+# HKLM wins over HKCU for Edge policy, so this copy is the one that can't be
+# overridden per-user and applies regardless of which OU a user object sits in. Added
+# after comparing against a real Edge policy GPO backed up from another server, which
+# set this same subset at both HKLM and HKCU rather than HKCU alone.
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$EdgeComputerGPO = "Settings: EDGE Computer Policies"
+
+$EdgeComputerKey = "HKLM\Software\Policies\Microsoft\Edge"
+
+# ------------------------------------------------------------
+# Edge policies stored as DWords (same key, same type - one call)
+# Policy: Force synchronization of browser data and do not show the sync consent
+#         prompt = Enabled (ForceSync = 1)
+# Policy: Hide the First-run experience and splash screen = Enabled
+#         (HideFirstRunExperience = 1)
+# Policy: Show Hubs Sidebar = Disabled (HubsSidebarEnabled = 0)
+# Policy: Show Microsoft Rewards experiences = Disabled (ShowMicrosoftRewards = 0)
+# Policy: Allow Microsoft News content on the new tab page = Disabled
+#         (NewTabPageContentEnabled = 0)
+# Policy: Hide the default top sites from the new tab page = Enabled
+#         (NewTabPageHideDefaultTopSites = 1)
+# ------------------------------------------------------------
+Set-ClkGPOValue `
+    -Name $EdgeComputerGPO `
+    -Key $EdgeComputerKey `
+    -ValueName "ForceSync", "HideFirstRunExperience", "HubsSidebarEnabled", "ShowMicrosoftRewards", "NewTabPageContentEnabled", "NewTabPageHideDefaultTopSites" `
+    -Type DWord `
+    -Value 1, 1, 0, 0, 0, 1
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Confirm-GPOPopulated $EdgeComputerGPO
 
 
 # ============================================================
@@ -1519,11 +1567,11 @@ Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 # A registry.pol value renders as a named policy if and only if a loaded ADMX defines
 # that exact key and value name, so that test decides where each of these can go.
 #
-# - Settings: EDGE Policies is populated but still owes a verification pass. The
-#   Central Store step above now imports msedge.admx/.adml, so the pass is just:
-#   after a run, open that GPO once. Anything left under Extra Registry Settings is
-#   a name or type that does not match its policy and needs correcting in the block
-#   above.
+# - Settings: EDGE User Policies and Settings: EDGE Computer Policies are populated
+#   but still owe a verification pass. The Central Store step above now imports
+#   msedge.admx/.adml, so the pass is just: after a run, open each GPO once. Anything
+#   left under Extra Registry Settings is a name or type that does not match its
+#   policy and needs correcting in the block above.
 #
 # - Security: Ctrl+Alt+Del and Customization: Regional / Explorer. No ADMX exists for
 #   any of these values. DisableCAD is a Security Option (GptTmpl.inf); the Explorer
