@@ -28,6 +28,7 @@
 # Version History:
 #   1.0: Initial version. Seeds the Central Store from the local PolicyDefinitions folder when it does not yet exist, then overlays the Windows 11, Office, Edge and Chrome templates, each downloaded at run time. Supports -SourceDir for DCs with no outbound internet access, and -WhatIf, which resolves and prints every download URL without fetching anything. Adds -Embedded, used by dcconfig.ps1 to call this script as its final step without a second prompt, a second transcript or a competing completion banner, taking back the failure count to fold into its own.
 #   1.1: The Cleanup step's Remove-Item -Recurse is now wrapped in its own try/catch. Found running v1.0 on the first live-DC test: it threw an ItemNotFoundException -ErrorAction SilentlyContinue did not suppress (most likely a file removed out from under the recursive delete by real-time AV scanning the just-downloaded installers), which reached the script-level trap and reported the whole Central Store import as failed even though every source - Base Windows, Windows 11, Office, Edge, Chrome - had already copied in successfully beforehand. A failed cleanup of a scratch temp folder is now a yellow warning, not a run failure.
+#   1.2: $WorkDir is now re-resolved to its canonical long-name path immediately after creation. Found on two live-DC test runs (as part of dcconfig v3.7 testing): cleanup consistently hit "An object at the specified path C:\Users\MRF250~1.DAL does not exist" - the 8.3 short-name alias %TEMP% resolved through for that account's profile - even though the folder was still present; re-resolving via Get-Item right after New-Item avoids depending on that alias staying resolvable through to cleanup.
 # ============================================================
 
 
@@ -512,6 +513,12 @@ if ($WhatIfPreference) {
 }
 
 New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+
+# $env:TEMP can resolve through an 8.3 short-name alias (observed live: mr.dalton's
+# profile via C:\Users\MRF250~1.DAL) that later becomes unresolvable to a literal
+# path lookup, making cleanup below fail even though the folder is still there.
+# Re-resolving to the canonical long-name path right after creation sidesteps that.
+$WorkDir = (Get-Item -LiteralPath $WorkDir).FullName
 
 # ============================================================
 # Base Windows Templates (Central Store seed)

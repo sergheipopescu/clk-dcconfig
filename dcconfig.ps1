@@ -31,6 +31,7 @@
 #   3.5: Fixes a bug, present since v3.1, that silently broke every DWord GPO setting in the script - the firewall enable/exceptions, Defender, AutoPlay, SMB hardening, GP refresh, RDP, Windows Update, NoSleep, wait-for-network, and 8 of the 14 EDGE Policies values. Set-ClkGPOValue's own -ValueName/-Value parameters are always arrays, so every call - even one carrying a single value - forced Set-GPRegistryValue into its array/"list" parameter set, which only supports -Type String or ExpandString; every other type throws, whether given one value or several. Only the String-typed writes (RemoteAddresses scoping, Edge's search-provider strings) were ever actually landing. Found running v3.4.1 - never released, renamed to 3.5 once this fix landed - on the first live-DC test. Set-ClkGPOValue now writes each name/value pair with its own Set-GPRegistryValue call and genuinely scalar arguments, so the reliable single-value parameter set is always used regardless of type or how many values a call site passes. Also: Set-ClkDefaultContainer now checks redircmp/redirusr's exit code instead of discarding it and printing the green success line unconditionally, so a default container redirection that did not happen is reported rather than silent. Its failures, and any later non-GPO baseline failure, are tallied in $script:ADFailures and reported by the completion banner, which previously could announce a fully successful run while that step had failed. Get-ClkScriptVersion's pattern now also accepts a three-part version, so a future patch release still gets picked up correctly rather than the banner silently reporting the prior X.Y version.
 #   3.6: Renames "Settings: EDGE Policies" to "Settings: EDGE User Policies" (still HKCU, still linked to the Users and Admins OUs) and adds a new "Settings: EDGE Computer Policies" GPO, linked to the Computers OU, writing ForceSync, HideFirstRunExperience, HubsSidebarEnabled, ShowMicrosoftRewards, NewTabPageContentEnabled and NewTabPageHideDefaultTopSites under HKLM as well. Prompted by comparing against a real Edge policy GPO backed up from another server: it set that same subset of values at the Computer level in addition to User, which our GPO never did. HKLM wins over HKCU for Edge policy, so the Computer-side copy is the one that can't be overridden per-user and applies regardless of which OU a user object sits in.
 #   3.7: Adds a new "Security: Point and Print" GPO, linked to the Computers OU: Package Point and Print restricted to a single trusted print server, plus Point and Print Restrictions scoped to the same server - the pairing that mitigates PrintNightmare. Found missing entirely by the same GPO-backup comparison that drove 3.6. The trusted server does not exist in AD yet at the time this script normally runs, so there is nothing to look up - a new "Print Server Input" prompt asks for its short hostname once and derives the FQDN from it, trusting both name forms since Point and Print's server-list matching is a literal string comparison with no name resolution. An IP is deliberately not asked for; add one to the GPO by hand later if the server also needs to be reachable that way.
+#   3.8: The "completed successfully" banner is now green and bookended by a closing bar, matching the visual weight of the opening "Starting dcconfig" banner instead of a single Cyan line easy to miss in a long console scrollback. Also picks up admxupdate.ps1 1.2 (see that script's own Version History) via the -Embedded call at the end of this script.
 # ============================================================
 
 
@@ -1690,7 +1691,8 @@ if ($TotalFailures -or $AdmxFailures -or $script:ADFailures) {
     Write-Host "Review the log at $LogFile and re-run once the cause is fixed." -ForegroundColor Red
 }
 else {
-    Write-Host "dcconfig $ScriptVersion completed successfully" -ForegroundColor Cyan
+    Write-Host "dcconfig $ScriptVersion completed successfully" -ForegroundColor Green
+    Write-Host "==============================" -ForegroundColor Green
 }
 
 Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
@@ -1699,36 +1701,74 @@ Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 
 # Future feature plan:
 #
-# Nine GPOs are still created empty with their links disabled, to be filled in by
+# Several GPOs are still created empty with their links disabled, to be filled in by
 # hand per deployment. Each is blocked on something specific, not merely unwritten -
 # the constraint is that every setting must render in GPMC/gpedit as a named policy,
 # never as "Extra Registry Settings", and that nothing may be hand-edited in SYSVOL.
 # A registry.pol value renders as a named policy if and only if a loaded ADMX defines
 # that exact key and value name, so that test decides where each of these can go.
 #
+# Category 1 - Placeholders that are ADMX-backed: low priority, just not done yet
+# ------------------------------------------------------------------------------
+# These stay disabled/empty on purpose for now, not because ADMX can't express them.
+# When picked up, they get built in-script like every other populated GPO above -
+# no backup/import needed.
+#
+# - Firewall: Allow ESMC uses the same WindowsFirewall.admx-backed mechanism already
+#   used by Firewall: Allow from DC / Allow from HQ (Set-ClkGPOValue against
+#   WindowsFirewall\DomainProfile\...\RemoteAddresses etc.). It remains a placeholder
+#   until ESMC's actual ports/addresses are known; will be enabled and populated by
+#   hand once specified.
+#
+# Category 2 - Placeholders that are not ADMX-based: future backed-up GPO restore
+# ---------------------------------------------------------------------------------
+# No ADMX defines these values (or, for Deploy: ESMC, no ADMX applies at all), so a
+# registry.pol write would only ever show as "Extra Registry Settings", not a named
+# policy - both are SYSVOL files/extensions the GroupPolicy module has no API for
+# (Set-GPRegistryValue writes registry.pol and nothing else). The route for all of
+# these is the same: configure each once by hand on a reference DC, Backup-GPO it
+# into this repo, and Import-GPO it here in a future version - the cmdlets do the
+# SYSVOL writing and the result is GUI-native. Note Import-GPO replaces a GPO's
+# entire contents, so a backup must be complete rather than incremental. All remain
+# placeholders for now.
+#
+# - Security: Ctrl+Alt+Del - DisableCAD is a Security Option (GptTmpl.inf), not ADMX.
+#
+# - Customization: Regional / Explorer - Control Panel\International and Explorer
+#   values are preferences, whose only GUI-native home is Preferences > Registry
+#   (Registry.xml).
+#
+# - Customization: NoCloud content is a mix: "Turn off Microsoft consumer experiences"
+#   is ADMX-backed, while the ContentDeliveryManager values are preferences. Check
+#   each value against the ADMX before deciding which half goes where when this is
+#   picked up; for now the whole GPO stays a placeholder.
+#
+# - Printers: Remove garbage - removing already-provisioned printer connections is a
+#   Preferences > Printers extension action (Printers.xml), no ADMX for it.
+#
+# - Customization: Lock Screen and Wallpaper are each half-covered: Personalization.admx
+#   ("Force a specific default lock screen image") and Desktop.admx ("Desktop Wallpaper")
+#   are real named policies, but both only store a path - the image file itself still has
+#   to land at that path on every machine by some other means (Preferences > Files, a
+#   share, or baking it into the workstation image). The pointer can be ADMX; the asset
+#   delivery can't, so the whole GPO defaults to the backup-import route and remains a
+#   placeholder for now.
+#
+# - Deploy: ESMC isn't a Policy or a Preference at all - it's software deployment (the
+#   ESET agent), which natively means a GPO Software Installation assignment. The
+#   GroupPolicy module has no API for that extension either, so it lands on the same
+#   backup-import route as the items above, but for a structurally different reason
+#   (a software-install assignment, not an unmanaged registry preference) - worth
+#   keeping distinct when explaining the split rather than lumping it in with "settings
+#   ADMX doesn't cover." Remains a placeholder for now.
+#
+# Category 3 - Tests still needed
+# --------------------------------
 # - Settings: EDGE User Policies and Settings: EDGE Computer Policies are populated
 #   but still owe a verification pass. The Central Store step above now imports
 #   msedge.admx/.adml, so the pass is just: after a run, open each GPO once. Anything
 #   left under Extra Registry Settings is a name or type that does not match its
 #   policy and needs correcting in the block above.
-#
-# - Security: Ctrl+Alt+Del and Customization: Regional / Explorer. No ADMX exists for
-#   any of these values. DisableCAD is a Security Option (GptTmpl.inf); the Explorer
-#   and Control Panel\International values are preferences, whose only GUI-native home
-#   is Preferences > Registry (Registry.xml). Both are SYSVOL files and the
-#   GroupPolicy module has no API for either - Set-GPRegistryValue writes registry.pol
-#   and nothing else. The one route that satisfies both constraints is to configure
-#   each once by hand on a reference DC, Backup-GPO it into this repo, and Import-GPO
-#   it here: the cmdlets do the SYSVOL writing, and the result is GUI-native. Note
-#   Import-GPO replaces a GPO's entire contents, so a backup must be complete rather
-#   than incremental.
-#
-# - Customization: NoCloud content is a mix: "Turn off Microsoft consumer experiences"
-#   is ADMX-backed, while the ContentDeliveryManager values are preferences. Check
-#   each value against the ADMX before deciding which half goes where.
-#
-# - Printers: Remove garbage, Customization: Lock Screen / Wallpaper, Deploy: ESMC and
-#   Firewall: Allow ESMC are unspecified beyond their names in gpos.xlsx.
 #
 # - Security: SMB Hardening writes SMB1 and the Browser service's Start value under
 #   HKLM\SYSTEM\CurrentControlSet\Services, which no ADMX covers and which is outside
@@ -1736,7 +1776,8 @@ Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
 #   The comments above them name GUI locations the values do not actually reach. The
 #   GUI-native equivalents are System Services (Import-GPO again) for the Browser
 #   service, and for SMBv1 removing the feature outright via DISM rather than a GPO.
+#   Needs a decision, not just a test, but flagged here until one is made.
 #
-# Validation still owed on a lab DC, both from the v3.3 firewall work: that
-# -PolicyStore tolerates the colon in GPO names such as "Firewall: Allow from DC",
-# and that Set-ClkGPOFirewallRule's update path behaves on a second run.
+# - Validation still owed on a lab DC, from the v3.3 firewall work: that -PolicyStore
+#   tolerates the colon in GPO names such as "Firewall: Allow from DC", and that
+#   Set-ClkGPOFirewallRule's update path behaves on a second run.
