@@ -32,6 +32,7 @@
 #   3.6: Renames "Settings: EDGE Policies" to "Settings: EDGE User Policies" (still HKCU, still linked to the Users and Admins OUs) and adds a new "Settings: EDGE Computer Policies" GPO, linked to the Computers OU, writing ForceSync, HideFirstRunExperience, HubsSidebarEnabled, ShowMicrosoftRewards, NewTabPageContentEnabled and NewTabPageHideDefaultTopSites under HKLM as well. Prompted by comparing against a real Edge policy GPO backed up from another server: it set that same subset of values at the Computer level in addition to User, which our GPO never did. HKLM wins over HKCU for Edge policy, so the Computer-side copy is the one that can't be overridden per-user and applies regardless of which OU a user object sits in.
 #   3.7: Adds a new "Security: Point and Print" GPO, linked to the Computers OU: Package Point and Print restricted to a single trusted print server, plus Point and Print Restrictions scoped to the same server - the pairing that mitigates PrintNightmare. Found missing entirely by the same GPO-backup comparison that drove 3.6. The trusted server does not exist in AD yet at the time this script normally runs, so there is nothing to look up - a new "Print Server Input" prompt asks for its short hostname once and derives the FQDN from it, trusting both name forms since Point and Print's server-list matching is a literal string comparison with no name resolution. An IP is deliberately not asked for; add one to the GPO by hand later if the server also needs to be reachable that way.
 #   3.8: The "completed successfully" banner is now green and bookended by a closing bar, matching the visual weight of the opening "Starting dcconfig" banner instead of a single Cyan line easy to miss in a long console scrollback. Also picks up admxupdate.ps1 1.2 (see that script's own Version History) via the -Embedded call at the end of this script.
+#   3.9: Fixes "Settings: GP Refresh", present since v3.2, writing to the wrong registry key - Software\Policies\Microsoft\Windows\Group Policy instead of the ADMX-defined \Windows\System. Found by remoting into the lab DC and comparing its GPO's XML report (which flagged the values as AdmSetting=false, i.e. not ADMX-matched) against the actual <policy name="GroupPolicyRefreshRate"> definition in GroupPolicy.admx, checked on both the lab DC's Central Store and this dev machine's own current local copy - both agree on \Windows\System. Since the wrong key isn't ADMX-recognized on either machine checked, the refresh interval may never have actually taken effect on a real DC, not merely displayed as unnamed Extra Registry Settings.
 # ============================================================
 
 
@@ -1327,6 +1328,14 @@ Confirm-GPOPopulated $WaitForNetworkGPO
 # GPO: Settings: GP Refresh
 # ADMX Policy: System\Group Policy\Set Group Policy refresh interval for computers = Enabled
 # Group Policy Refresh Interval: 15 minutes, Random offset: 2 minutes
+#
+# Key is Software\Policies\Microsoft\Windows\System, not \Windows\Group Policy -
+# confirmed against the policy's actual <policy name="GroupPolicyRefreshRate">
+# definition in GroupPolicy.admx (both a lab DC's Central Store copy and this dev
+# machine's own current local copy agree). \Windows\Group Policy was where this
+# script wrote it through v3.8; that key isn't ADMX-recognized on either machine
+# checked, so the GPO rendered as unnamed Extra Registry Settings and the interval
+# may never have actually taken effect - not just a cosmetic display gap.
 ###
 
 # ------------------------------------------------------------
@@ -1341,7 +1350,7 @@ $GPRefreshGPO = "Settings: GP Refresh"
 # ------------------------------------------------------------
 Set-ClkGPOValue `
     -Name $GPRefreshGPO `
-    -Key "HKLM\Software\Policies\Microsoft\Windows\Group Policy" `
+    -Key "HKLM\Software\Policies\Microsoft\Windows\System" `
     -ValueName "GroupPolicyRefreshTime", "GroupPolicyRefreshTimeOffset" `
     -Type DWord `
     -Value 15, 2
