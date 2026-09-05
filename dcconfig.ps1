@@ -30,6 +30,7 @@
 #   3.4: Adds admxupdate.ps1, a second script that imports the current Windows 11, Office, Edge and Chrome ADMX/ADML templates into the domain's Group Policy Central Store, so the policies this script writes render as named policies in GPMC rather than as Extra Registry Settings. It stands alone - it is the one to re-run on other DCs, or when a new Windows release ships, since the Central Store is a single replicated path rather than per-DC state - and dcconfig.ps1 also calls it as its final step with -Embedded, which suppresses its prompt, transcript and banners and hands back a failure count for the completion banner to report separately from the GPO tally. Placed last because nothing above depends on it: registry.pol records no reference to any ADMX, so the Central Store only decides how already-correct settings display. New -SkipCentralStore switch leaves it out, and a missing admxupdate.ps1 is a warning rather than a failure, so dcconfig.ps1 still works when it is the only file copied to a DC.
 #   3.5: Fixes a bug, present since v3.1, that silently broke every DWord GPO setting in the script - the firewall enable/exceptions, Defender, AutoPlay, SMB hardening, GP refresh, RDP, Windows Update, NoSleep, wait-for-network, and 8 of the 14 EDGE Policies values. Set-ClkGPOValue's own -ValueName/-Value parameters are always arrays, so every call - even one carrying a single value - forced Set-GPRegistryValue into its array/"list" parameter set, which only supports -Type String or ExpandString; every other type throws, whether given one value or several. Only the String-typed writes (RemoteAddresses scoping, Edge's search-provider strings) were ever actually landing. Found running v3.4.1 - never released, renamed to 3.5 once this fix landed - on the first live-DC test. Set-ClkGPOValue now writes each name/value pair with its own Set-GPRegistryValue call and genuinely scalar arguments, so the reliable single-value parameter set is always used regardless of type or how many values a call site passes. Also: Set-ClkDefaultContainer now checks redircmp/redirusr's exit code instead of discarding it and printing the green success line unconditionally, so a default container redirection that did not happen is reported rather than silent. Its failures, and any later non-GPO baseline failure, are tallied in $script:ADFailures and reported by the completion banner, which previously could announce a fully successful run while that step had failed. Get-ClkScriptVersion's pattern now also accepts a three-part version, so a future patch release still gets picked up correctly rather than the banner silently reporting the prior X.Y version.
 #   3.6: Renames "Settings: EDGE Policies" to "Settings: EDGE User Policies" (still HKCU, still linked to the Users and Admins OUs) and adds a new "Settings: EDGE Computer Policies" GPO, linked to the Computers OU, writing ForceSync, HideFirstRunExperience, HubsSidebarEnabled, ShowMicrosoftRewards, NewTabPageContentEnabled and NewTabPageHideDefaultTopSites under HKLM as well. Prompted by comparing against a real Edge policy GPO backed up from another server: it set that same subset of values at the Computer level in addition to User, which our GPO never did. HKLM wins over HKCU for Edge policy, so the Computer-side copy is the one that can't be overridden per-user and applies regardless of which OU a user object sits in.
+#   3.7: Adds a new "Security: Point and Print" GPO, linked to the Computers OU: Package Point and Print restricted to a single trusted print server, plus Point and Print Restrictions scoped to the same server - the pairing that mitigates PrintNightmare. Found missing entirely by the same GPO-backup comparison that drove 3.6. The trusted server does not exist in AD yet at the time this script normally runs, so there is nothing to look up - a new "Print Server Input" prompt asks for its short hostname once and derives the FQDN from it, trusting both name forms since Point and Print's server-list matching is a literal string comparison with no name resolution. An IP is deliberately not asked for; add one to the GPO by hand later if the server also needs to be reachable that way.
 # ============================================================
 
 
@@ -455,6 +456,35 @@ $ServersOU      = "OU=Servers,$ComputersOU"
 $WorkstationsOU = "OU=Workstations,$ComputersOU"
 
 # ============================================================
+# Print Server Input
+# ============================================================
+# Feeds "Security: Point and Print" below. Asked for here, rather than hardcoded,
+# because the server does not exist in AD yet at the time this script normally
+# runs - there is nothing to look up. Only a short hostname is asked for; the FQDN
+# is derived from it plus this domain's DNS root, so both name forms a client
+# might use in a UNC path get trusted without having to type either twice. An IP
+# is deliberately not asked for here - add one to the GPO by hand later if needed,
+# once the server (and its address) actually exist.
+$PrintServerShortName = Read-Host "Enter the trusted print server's short hostname (e.g. STORAGE01)"
+
+if ([string]::IsNullOrWhiteSpace($PrintServerShortName)) {
+    Write-Host "Print server hostname cannot be empty. Exiting." -ForegroundColor Red
+    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+    return
+}
+
+# NetBIOS computer names are capped at 15 characters and may not contain spaces or
+# most punctuation - reject up front rather than write a name here that would never
+# match the machine's actual short name.
+if ($PrintServerShortName -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,14}$') {
+    Write-Host "Print server hostname must start with a letter or digit and contain only letters, digits and hyphens (max 15 characters). Exiting." -ForegroundColor Red
+    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+    return
+}
+
+$PrintServerFQDN = "$PrintServerShortName.$($Domain.DNSRoot)"
+
+# ============================================================
 # Confirmation
 # ============================================================
 Write-Host ""
@@ -465,6 +495,7 @@ Write-Host "  - 'Janitors' admin group, with the current user added as a member"
 Write-Host "  - Current user moved to the Admins OU"
 Write-Host "  - Fine-Grained Password Policies for admins and users"
 Write-Host "  - Baseline GPOs, created, linked to their target OUs, and populated with security/firewall/Defender/SMB/RDP/Update settings"
+Write-Host "  - 'Security: Point and Print' scoped to trusted print server '$PrintServerShortName' / '$PrintServerFQDN'"
 if (-not $SkipCentralStore) {
     Write-Host "  - Current Windows 11 / Office / Edge / Chrome ADMX templates imported into the domain's Group Policy Central Store"
     Write-Host "    (via admxupdate.ps1, as the last step - downloads roughly 170 MB; pass -SkipCentralStore to leave it out)"
@@ -653,6 +684,7 @@ $GPOs = @(
     [PSCustomObject]@{ Name = "Security: Ctrl+Alt+Del";              TargetOU = @($ComputersOU);        Disabled = $true  }
     [PSCustomObject]@{ Name = "Security: Disable AutoPlay";          TargetOU = @($ComputersOU);        Disabled = $false }
     [PSCustomObject]@{ Name = "Security: SMB Hardening";             TargetOU = @($ComputersOU);        Disabled = $false }
+    [PSCustomObject]@{ Name = "Security: Point and Print";           TargetOU = @($ComputersOU);        Disabled = $false }
     [PSCustomObject]@{ Name = "Settings: Wait for network";          TargetOU = @($ComputersOU);        Disabled = $false }
     [PSCustomObject]@{ Name = "Settings: GP Refresh";                TargetOU = @($ServersOU, $ComputersOU); Disabled = $false }
     # Intentionally at the Computers OU: RDP is enabled on workstations as well as
@@ -1153,6 +1185,113 @@ Set-ClkGPOValue `
 # Confirm settings population
 # ------------------------------------------------------------
 Confirm-GPOPopulated $SmbHardeningGPO
+
+
+###
+# GPO: Security: Point and Print
+# ADMX Policies: Printers > Point and Print Restrictions, Printers > Package Point
+#                and print - Approved servers
+#
+# Computer configuration (HKLM), linked to the Computers OU. Restricts driver
+# installation via Point and Print to a single trusted print server, and restricts
+# unpackaged ("legacy") Point and Print to the same server via Package Point and
+# Print - the pairing that mitigates PrintNightmare (CVE-2021-34527/CVE-2021-1675)
+# without disabling printing outright. Modeled on a GPO backed up from another
+# server in the org, which scoped both policies to its print server the same way.
+# The trusted server's short hostname and FQDN are asked for at the top of the
+# script (see "Print Server Input") rather than hardcoded here.
+###
+
+# ------------------------------------------------------------
+# Target GPO
+# ------------------------------------------------------------
+$PointAndPrintGPO = "Security: Point and Print"
+
+# ------------------------------------------------------------
+# Trusted print server: both name forms a client might use in a UNC path, entered
+# once at the top of the script (see "Print Server Input") since the server does
+# not exist in AD yet at the time this normally runs. Add its IP here by hand later
+# if it also needs to be reachable that way.
+# ------------------------------------------------------------
+$PrintServerNames = @($PrintServerShortName, $PrintServerFQDN)
+
+# ------------------------------------------------------------
+# Package Point and print - Approved servers (same key, same type - one call)
+# Policy: Package Point and print - Approved servers = Enabled
+#         (PackagePointAndPrintOnly = 1, PackagePointAndPrintServerList = 1)
+# ------------------------------------------------------------
+Set-ClkGPOValue `
+    -Name $PointAndPrintGPO `
+    -Key "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint" `
+    -ValueName "PackagePointAndPrintOnly", "PackagePointAndPrintServerList" `
+    -Type DWord `
+    -Value 1, 1
+
+# ------------------------------------------------------------
+# Package Point and print server list: this policy stores its approved servers as
+# one value per server, with both the value's name and its data set to the server
+# address - not as a single multi-valued key. One call per name form so each gets
+# its own name/data pair rather than being merged into one.
+# ------------------------------------------------------------
+foreach ($PrintServerName in $PrintServerNames) {
+    Set-ClkGPOValue `
+        -Name $PointAndPrintGPO `
+        -Key "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PackagePointAndPrint\ListofServers" `
+        -ValueName $PrintServerName `
+        -Type String `
+        -Value $PrintServerName
+}
+
+# ------------------------------------------------------------
+# Point and Print Restrictions (same key, same type - one call)
+# Policy: Point and Print Restrictions = Enabled
+#         (Restricted = 1)
+#         Users can only point and print to these servers (TrustedServers = 1)
+#         When installing drivers for a new connection: Do not show warning or
+#         elevation prompt (NoWarningNoElevationOnInstall = 1)
+#         When updating drivers for an existing connection: Do not show warning or
+#         elevation prompt (UpdatePromptSettings = 1)
+# ------------------------------------------------------------
+Set-ClkGPOValue `
+    -Name $PointAndPrintGPO `
+    -Key "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" `
+    -ValueName "Restricted", "TrustedServers", "NoWarningNoElevationOnInstall", "UpdatePromptSettings" `
+    -Type DWord `
+    -Value 1, 1, 1, 1
+
+# ------------------------------------------------------------
+# Point and Print Restrictions: server list, scoped to the same trusted print
+# server (String, unlike the DWord values above - separate call). Unlike
+# ListofServers above, this policy takes both name forms as one semicolon-delimited
+# value rather than one entry per server.
+# ------------------------------------------------------------
+Set-ClkGPOValue `
+    -Name $PointAndPrintGPO `
+    -Key "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" `
+    -ValueName "ServerList" `
+    -Type String `
+    -Value ($PrintServerNames -join ";")
+
+# ------------------------------------------------------------
+# Limit print driver installation to Administrators = Disabled
+# (RestrictDriverInstallationToAdministrators = 0)
+#
+# Kept explicitly Disabled (matching the source GPO) rather than left unconfigured:
+# the Point and Print Restrictions above already gate driver installs to the
+# trusted server, and requiring admin rights on top would block ordinary users from
+# connecting to that server's shared printers at all.
+# ------------------------------------------------------------
+Set-ClkGPOValue `
+    -Name $PointAndPrintGPO `
+    -Key "HKLM\Software\Policies\Microsoft\Windows NT\Printers\PointAndPrint" `
+    -ValueName "RestrictDriverInstallationToAdministrators" `
+    -Type DWord `
+    -Value 0
+
+# ------------------------------------------------------------
+# Confirm settings population
+# ------------------------------------------------------------
+Confirm-GPOPopulated $PointAndPrintGPO
 
 
 ###
